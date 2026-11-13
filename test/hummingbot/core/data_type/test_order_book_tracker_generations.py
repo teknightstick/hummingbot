@@ -1,12 +1,76 @@
 import asyncio
 import time
+from collections import defaultdict
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import AsyncMock, MagicMock
 
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.order_book_tracker import OrderBookTracker, _OrderBookMessageEnvelope
-from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+from hummingbot.core.data_type.order_book_tracker_data_source import (
+    _UNBOUND_RAW_QUEUE_GENERATION,
+    OrderBookTrackerDataSource,
+)
+
+
+class _LifecycleProbeSource(OrderBookTrackerDataSource):
+    def __init__(self):
+        super().__init__(trading_pairs=[])
+        self.remote_pairs = set()
+        self.listener_generations = []
+        self.unsubscribe_started = asyncio.Event()
+        self.unsubscribe_release = asyncio.Event()
+        self.block_unsubscribe = False
+        self.unsubscribe_result = True
+        self.unsubscribe_calls = 0
+
+    async def get_last_traded_prices(self, trading_pairs, domain=None):
+        await asyncio.Future()
+
+    async def get_new_order_book(self, trading_pair):
+        return OrderBook()
+
+    async def listen_for_subscriptions(self):
+        self.listener_generations.append(self._raw_message_queue_context.get())
+        for trading_pair in self._trading_pairs:
+            self.remote_pairs.add(trading_pair)
+        await asyncio.Future()
+
+    async def subscribe_to_trading_pair(self, trading_pair):
+        self.add_trading_pair(trading_pair)
+        self.remote_pairs.add(trading_pair)
+        return True
+
+    async def unsubscribe_from_trading_pair(self, trading_pair):
+        self.unsubscribe_calls += 1
+        if self.block_unsubscribe:
+            self.unsubscribe_started.set()
+            await self.unsubscribe_release.wait()
+        if self.unsubscribe_result:
+            self.remote_pairs.discard(trading_pair)
+            self.remove_trading_pair(trading_pair)
+        return self.unsubscribe_result
+
+    async def _parse_trade_message(self, raw_message, message_queue):
+        return None
+
+    async def _parse_order_book_diff_message(self, raw_message, message_queue):
+        return None
+
+    async def _parse_order_book_snapshot_message(self, raw_message, message_queue):
+        return None
+
+    async def _order_book_snapshot(self, trading_pair):
+        raise NotImplementedError
+
+    async def _connected_websocket_assistant(self):
+        raise NotImplementedError
+
+    async def _subscribe_channels(self, ws):
+        raise NotImplementedError
+
+    def _channel_originating_message(self, event_message):
+        raise NotImplementedError
 
 
 class OrderBookTrackerGenerationTests(IsolatedAsyncioWrapperTestCase):
@@ -313,3 +377,164 @@ class OrderBookTrackerGenerationTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertNotEqual(999.0, replacement_book.last_trade_price)
         tracker.stop()
+
+    async def test_start_caller_stays_unbound_and_resolves_replacement_generation(self):
+        source = _LifecycleProbeSource()
+        tracker = OrderBookTracker(data_source=source, trading_pairs=[])
+        tracker._sleep = AsyncMock()
+        first_started = asyncio.Event()
+        replacement_started = asyncio.Event()
+        observed = {}
+
+        async def task_a_start_and_access():
+            tracker.start()
+            await asyncio.wait_for(tracker.wait_ready(), timeout=0.2)
+            observed["first_generation"] = tracker._active_generation
+            observed["caller_context"] = source._raw_message_queue_context.get()
+            first_started.set()
+            await asyncio.wait_for(replacement_started.wait(), timeout=0.2)
+            replacement = defaultdict(asyncio.Queue)
+            source._message_queue = replacement
+            source._message_queue["task-a"].put_nowait("current")
+            observed["replacement"] = replacement
+            observed["post_restart_context"] = source._raw_message_queue_context.get()
+
+        caller_task = asyncio.create_task(task_a_start_and_access())
+        await asyncio.wait_for(first_started.wait(), timeout=0.2)
+        await asyncio.wait_for(tracker.stop_and_wait(timeout=0.2), timeout=0.4)
+        tracker.start()
+        await asyncio.wait_for(tracker.wait_ready(), timeout=0.2)
+        active_generation = tracker._active_generation
+        replacement_started.set()
+        await asyncio.wait_for(caller_task, timeout=0.2)
+        source._message_queue["external"].put_nowait("current")
+
+        self.assertIs(_UNBOUND_RAW_QUEUE_GENERATION, observed["caller_context"])
+        self.assertIs(_UNBOUND_RAW_QUEUE_GENERATION, observed["post_restart_context"])
+        self.assertNotIn(observed["first_generation"], source._raw_message_queues)
+        self.assertIs(observed["replacement"], source._raw_message_queues[active_generation])
+        self.assertEqual(1, source._raw_message_queues[active_generation]["task-a"].qsize())
+        self.assertEqual(1, source._raw_message_queues[active_generation]["external"].qsize())
+        self.assertIn(active_generation, source.listener_generations)
+        await asyncio.wait_for(tracker.stop_and_wait(timeout=0.2), timeout=0.4)
+
+    async def test_retired_bound_context_cannot_recreate_mapping_by_assignment_or_access(self):
+        source = _LifecycleProbeSource()
+        source.activate_raw_message_generation(1)
+        token = source.bind_raw_message_generation(1)
+        try:
+            source.deactivate_raw_message_generation(1)
+            source.activate_raw_message_generation(2)
+            source._message_queue = defaultdict(asyncio.Queue)
+            source._message_queue["stale"].put_nowait("discard")
+
+            self.assertNotIn(1, source._raw_message_queues)
+            self.assertEqual(0, source._message_queue["stale"].qsize())
+        finally:
+            source.reset_raw_message_generation(token)
+
+        source._message_queue["current"].put_nowait("deliver")
+        self.assertEqual(1, source._raw_message_queues[2]["current"].qsize())
+
+    async def test_tracker_then_caller_cancellation_is_never_converted_to_false(self):
+        source = _LifecycleProbeSource()
+        subscribe_started = asyncio.Event()
+        tracker_cancel_consumed = asyncio.Event()
+
+        async def cancellation_resistant_subscribe(trading_pair):
+            subscribe_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                asyncio.current_task().uncancel()
+                tracker_cancel_consumed.set()
+                await asyncio.Future()
+            return True
+
+        source.subscribe_to_trading_pair = cancellation_resistant_subscribe
+        tracker = OrderBookTracker(data_source=source, trading_pairs=[])
+        tracker._sleep = AsyncMock()
+        tracker.start()
+        await asyncio.wait_for(tracker.wait_ready(), timeout=0.2)
+        add_task = asyncio.create_task(tracker.add_trading_pair("CANCEL-USDT"))
+        await asyncio.wait_for(subscribe_started.wait(), timeout=0.2)
+        tracker.stop()
+        await asyncio.wait_for(tracker_cancel_consumed.wait(), timeout=0.2)
+        add_task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(add_task, timeout=0.2)
+        self.assertEqual(1, source.unsubscribe_calls)
+        self.assertTrue(await asyncio.wait_for(tracker.stop_and_wait(timeout=0.2), timeout=0.4))
+        self.assertEqual(set(), tracker._tasks_to_drain)
+
+    async def test_direct_restart_fails_closed_while_dynamic_cleanup_is_pending(self):
+        for replacement_pair in ("DYNAMIC-USDT", "OTHER-USDT"):
+            source = _LifecycleProbeSource()
+            tracker = OrderBookTracker(data_source=source, trading_pairs=[])
+            tracker._sleep = AsyncMock()
+            tracker.start()
+            await asyncio.wait_for(tracker.wait_ready(), timeout=0.2)
+            self.assertTrue(await tracker.add_trading_pair("DYNAMIC-USDT"))
+            source.block_unsubscribe = True
+            if replacement_pair != "DYNAMIC-USDT":
+                tracker._trading_pairs[:] = [replacement_pair]
+
+            try:
+                with self.assertRaisesRegex(RuntimeError, "stop_and_wait"):
+                    tracker.start()
+                await asyncio.wait_for(source.unsubscribe_started.wait(), timeout=0.2)
+                self.assertIsNone(tracker._active_generation)
+            finally:
+                source.unsubscribe_release.set()
+                source.block_unsubscribe = False
+                await asyncio.wait_for(tracker.stop_and_wait(timeout=0.2), timeout=0.4)
+
+    async def test_clean_drain_allows_restart_but_residual_cleanup_does_not(self):
+        source = _LifecycleProbeSource()
+        tracker = OrderBookTracker(data_source=source, trading_pairs=[])
+        tracker._sleep = AsyncMock()
+        tracker.start()
+        await asyncio.wait_for(tracker.wait_ready(), timeout=0.2)
+        self.assertTrue(await tracker.add_trading_pair("DYNAMIC-USDT"))
+        self.assertTrue(await asyncio.wait_for(tracker.stop_and_wait(timeout=0.2), timeout=0.4))
+
+        tracker.start()
+        await asyncio.wait_for(tracker.wait_ready(), timeout=0.2)
+        self.assertIsNotNone(tracker._active_generation)
+        await asyncio.wait_for(tracker.stop_and_wait(timeout=0.2), timeout=0.4)
+
+        source.unsubscribe_result = False
+        tracker.start()
+        await asyncio.wait_for(tracker.wait_ready(), timeout=0.2)
+        self.assertTrue(await tracker.add_trading_pair("RESIDUAL-USDT"))
+        self.assertFalse(await asyncio.wait_for(tracker.stop_and_wait(timeout=0.2), timeout=0.4))
+        with self.assertRaisesRegex(RuntimeError, "stop_and_wait"):
+            tracker.start()
+        self.assertIsNone(tracker._active_generation)
+
+        source.unsubscribe_result = True
+        self.assertTrue(await asyncio.wait_for(tracker.stop_and_wait(timeout=0.2), timeout=0.4))
+
+    async def test_generation_scoped_cleanup_cannot_clear_newer_markers(self):
+        source = _LifecycleProbeSource()
+        tracker = OrderBookTracker(data_source=source, trading_pairs=[])
+        tracker._dynamic_subscriptions.add("PAIR-USDT")
+        tracker._dynamic_subscription_generations["PAIR-USDT"] = 2
+
+        self.assertTrue(await tracker._unsubscribe_for_cleanup("PAIR-USDT", 1))
+
+        self.assertIn("PAIR-USDT", tracker._dynamic_subscriptions)
+        self.assertEqual(2, tracker._dynamic_subscription_generations["PAIR-USDT"])
+
+    async def test_retired_generation_and_pair_lock_metadata_are_pruned(self):
+        source = _LifecycleProbeSource()
+        for generation in range(1, 101):
+            source.activate_raw_message_generation(generation)
+            source.deactivate_raw_message_generation(generation)
+        tracker = OrderBookTracker(data_source=source, trading_pairs=[])
+        for index in range(100):
+            tracker._pair_transaction_lock(f"PAIR-{index}")
+
+        self.assertLessEqual(len(source._retired_raw_message_generations), 1)
+        self.assertEqual(0, len(tracker._pair_transaction_locks))

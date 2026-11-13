@@ -77,6 +77,7 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
             default=_UNBOUND_RAW_QUEUE_GENERATION,
         )
         self._active_raw_message_generation: Optional[int] = None
+        self._retired_raw_message_generation_floor: int = -1
         self._retired_raw_message_generations: set[int] = set()
         self._raw_message_queues: Dict[Optional[int], MutableMapping[str, asyncio.Queue]] = {
             None: defaultdict(asyncio.Queue)
@@ -94,27 +95,34 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
         generation = self._raw_message_queue_context.get()
         if generation is _UNBOUND_RAW_QUEUE_GENERATION:
             generation = self._active_raw_message_generation
+        if self._raw_message_generation_is_retired(generation):
+            return
         self._raw_message_queues[generation] = value
 
     def activate_raw_message_generation(self, generation: int):
-        """Create and bind a fresh raw-frame queue set for a tracker generation."""
+        """Create a fresh raw-frame queue set without changing the caller task's context."""
+        if self._raw_message_generation_is_retired(generation):
+            raise RuntimeError(f"Raw message generation {generation} has already been retired.")
         self._active_raw_message_generation = generation
-        self._retired_raw_message_generations.discard(generation)
         self._raw_message_queues[generation] = defaultdict(asyncio.Queue)
-        self._raw_message_queue_context.set(generation)
 
     def deactivate_raw_message_generation(self, generation: Optional[int]):
         """Retire raw queues before cancelling their producer and parser tasks."""
         if generation is None:
             return
-        self._retired_raw_message_generations.add(generation)
+        self._retired_raw_message_generation_floor = max(
+            self._retired_raw_message_generation_floor,
+            generation,
+        )
+        # Keep one compatibility marker while the high-water mark rejects every
+        # older inherited context without retaining one entry per generation.
+        self._retired_raw_message_generations.clear()
+        self._retired_raw_message_generations.add(self._retired_raw_message_generation_floor)
         queues = self._raw_message_queues.pop(generation, None)
         if queues is not None:
             queues.clear()
         if self._active_raw_message_generation == generation:
             self._active_raw_message_generation = None
-        if self._raw_message_queue_context.get() == generation:
-            self._raw_message_queue_context.set(_UNBOUND_RAW_QUEUE_GENERATION)
 
     def bind_raw_message_generation(self, generation: Optional[int]) -> Token:
         """Bind raw writes spawned by the current lifecycle transaction."""
@@ -123,11 +131,18 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
     def reset_raw_message_generation(self, token: Token):
         self._raw_message_queue_context.reset(token)
 
+    def _raw_message_generation_is_retired(self, generation) -> bool:
+        return (
+            isinstance(generation, int)
+            and generation <= self._retired_raw_message_generation_floor
+            and generation != self._active_raw_message_generation
+        )
+
     def _raw_message_mapping_for_context(self) -> MutableMapping[str, asyncio.Queue]:
         generation = self._raw_message_queue_context.get()
         if generation is _UNBOUND_RAW_QUEUE_GENERATION:
             generation = self._active_raw_message_generation
-        if generation in self._retired_raw_message_generations:
+        if self._raw_message_generation_is_retired(generation):
             return self._discarded_raw_message_queues
         if generation not in self._raw_message_queues:
             self._raw_message_queues[generation] = defaultdict(asyncio.Queue)

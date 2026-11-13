@@ -5,6 +5,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Deque, Dict, List, Optional, Tuple
+from weakref import WeakValueDictionary
 
 import pandas as pd
 
@@ -13,8 +14,14 @@ from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.event.events import OrderBookTradeEvent
-from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.logger import HummingbotLogger
+
+
+_TRACKER_OWNED_CANCELLATION = object()
+
+
+class OrderBookTrackerLifecycleError(RuntimeError):
+    """Raised when a synchronous tracker start cannot safely cross pending cleanup."""
 
 
 class OrderBookTrackerDataSourceType(Enum):
@@ -279,11 +286,13 @@ class OrderBookTracker:
         self._active_generation: Optional[int] = None
         self._tasks_to_drain: set[asyncio.Task] = set()
         self._in_flight_transactions: set[asyncio.Task] = set()
-        self._tracker_cancellation_counts: Dict[asyncio.Task, int] = {}
-        self._pair_transaction_locks: Dict[str, asyncio.Lock] = {}
+        self._pair_transaction_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._dynamic_subscriptions: set[str] = set()
+        self._dynamic_subscription_generations: Dict[str, int] = {}
         self._residual_subscriptions: set[str] = set()
+        self._residual_subscription_generations: Dict[str, int] = {}
         self._shutdown_unsubscribe_tasks: Dict[str, asyncio.Task] = {}
+        self._shutdown_unsubscribe_generations: Dict[str, int] = {}
 
         self._emit_trade_event_task: Optional[asyncio.Task] = None
         self._init_order_books_task: Optional[asyncio.Task] = None
@@ -327,44 +336,72 @@ class OrderBookTracker:
         """Remote subscriptions whose last cleanup attempt did not succeed."""
         return frozenset(self._residual_subscriptions)
 
+    async def _run_tracker_task(self, method_name: str, *args):
+        try:
+            return await getattr(self, method_name)(*args)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exception:
+            self.logger().error(
+                f"Unhandled error in order book tracker task {method_name}: {exception}",
+                exc_info=True,
+            )
+
+    async def _run_data_source_task(self, generation: int, method_name: str, *args):
+        token = self._data_source.bind_raw_message_generation(generation)
+        try:
+            return await getattr(self._data_source, method_name)(*args)
+        finally:
+            self._data_source.reset_raw_message_generation(token)
+
+    def _schedule_tracker_task(self, method_name: str, *args) -> asyncio.Task:
+        return asyncio.ensure_future(self._run_tracker_task(method_name, *args))
+
+    def _schedule_data_source_task(self, generation: int, method_name: str, *args) -> asyncio.Task:
+        return asyncio.ensure_future(self._run_data_source_task(generation, method_name, *args))
+
     def start(self):
         self.stop()
+        if self._dynamic_subscriptions or self._residual_subscriptions or any(
+            not task.done() for task in self._shutdown_unsubscribe_tasks.values()
+        ):
+            raise OrderBookTrackerLifecycleError(
+                "Order book tracker cleanup is pending; await stop_and_wait() before start()."
+            )
         generation = self._generation
         self._active_generation = generation
         self._data_source.activate_raw_message_generation(generation)
         self._metrics.tracker_start_time = time.perf_counter()
-        self._init_order_books_task = safe_ensure_future(
-            self._init_order_books(generation)
+        self._init_order_books_task = self._schedule_tracker_task("_init_order_books", generation)
+        self._emit_trade_event_task = self._schedule_tracker_task("_emit_trade_event_loop", generation)
+        self._order_book_diff_listener_task = self._schedule_data_source_task(
+            generation,
+            "listen_for_order_book_diffs",
+            self._ev_loop,
+            _GenerationBoundQueue(self._order_book_diff_stream, generation),
         )
-        self._emit_trade_event_task = safe_ensure_future(
-            self._emit_trade_event_loop(generation)
+        self._order_book_trade_listener_task = self._schedule_data_source_task(
+            generation,
+            "listen_for_trades",
+            self._ev_loop,
+            _GenerationBoundQueue(self._order_book_trade_stream, generation),
         )
-        self._order_book_diff_listener_task = safe_ensure_future(
-            self._data_source.listen_for_order_book_diffs(
-                self._ev_loop, _GenerationBoundQueue(self._order_book_diff_stream, generation)
-            )
+        self._order_book_snapshot_listener_task = self._schedule_data_source_task(
+            generation,
+            "listen_for_order_book_snapshots",
+            self._ev_loop,
+            _GenerationBoundQueue(self._order_book_snapshot_stream, generation),
         )
-        self._order_book_trade_listener_task = safe_ensure_future(
-            self._data_source.listen_for_trades(
-                self._ev_loop, _GenerationBoundQueue(self._order_book_trade_stream, generation)
-            )
+        self._order_book_stream_listener_task = self._schedule_data_source_task(
+            generation,
+            "listen_for_subscriptions",
         )
-        self._order_book_snapshot_listener_task = safe_ensure_future(
-            self._data_source.listen_for_order_book_snapshots(
-                self._ev_loop, _GenerationBoundQueue(self._order_book_snapshot_stream, generation)
-            )
+        self._order_book_diff_router_task = self._schedule_tracker_task("_order_book_diff_router", generation)
+        self._order_book_snapshot_router_task = self._schedule_tracker_task(
+            "_order_book_snapshot_router", generation
         )
-        self._order_book_stream_listener_task = safe_ensure_future(
-            self._data_source.listen_for_subscriptions()
-        )
-        self._order_book_diff_router_task = safe_ensure_future(
-            self._order_book_diff_router(generation)
-        )
-        self._order_book_snapshot_router_task = safe_ensure_future(
-            self._order_book_snapshot_router(generation)
-        )
-        self._update_last_trade_prices_task = safe_ensure_future(
-            self._update_last_trade_prices_loop(generation)
+        self._update_last_trade_prices_task = self._schedule_tracker_task(
+            "_update_last_trade_prices_loop", generation
         )
 
     def stop(self):
@@ -424,13 +461,7 @@ class OrderBookTracker:
                 task.cancel()
             self._tracking_tasks.clear()
         for task in tuple(self._in_flight_transactions):
-            cancelling_before = task.cancelling()
-            task.cancel()
-            owned_cancellations = task.cancelling() - cancelling_before
-            if owned_cancellations:
-                self._tracker_cancellation_counts[task] = (
-                    self._tracker_cancellation_counts.get(task, 0) + owned_cancellations
-                )
+            task.cancel(_TRACKER_OWNED_CANCELLATION)
         self._order_books.clear()
         self._tracking_message_queues.clear()
         self._saved_message_queues.clear()
@@ -438,7 +469,12 @@ class OrderBookTracker:
         for task in tasks_to_drain:
             self._track_task_for_drain(task)
         for trading_pair in self._dynamic_subscriptions | self._residual_subscriptions:
-            self._schedule_subscription_cleanup(trading_pair)
+            owner_generation = self._dynamic_subscription_generations.get(
+                trading_pair,
+                self._residual_subscription_generations.get(trading_pair, active_generation),
+            )
+            if owner_generation is not None:
+                self._schedule_subscription_cleanup(trading_pair, owner_generation)
 
     def _track_task_for_drain(self, task: Optional[asyncio.Task]):
         if task is not None and not task.done() and task not in self._tasks_to_drain:
@@ -498,48 +534,63 @@ class OrderBookTracker:
             self._in_flight_transactions.add(task)
         return task
 
-    def _cancelled_only_by_tracker(self, task: Optional[asyncio.Task]) -> bool:
-        if task is None:
-            return False
-        tracker_cancellations = self._tracker_cancellation_counts.get(task, 0)
-        return tracker_cancellations > 0 and task.cancelling() <= tracker_cancellations
+    @staticmethod
+    def _cancelled_by_tracker(cancellation: asyncio.CancelledError) -> bool:
+        return bool(cancellation.args) and cancellation.args[0] is _TRACKER_OWNED_CANCELLATION
 
-    def _schedule_subscription_cleanup(self, trading_pair: str) -> asyncio.Task:
+    def _schedule_subscription_cleanup(self, trading_pair: str, generation: int) -> asyncio.Task:
         existing = self._shutdown_unsubscribe_tasks.get(trading_pair)
         if existing is not None and not existing.done():
             return existing
-        task = safe_ensure_future(self._unsubscribe_for_cleanup(trading_pair))
+        task = asyncio.ensure_future(self._unsubscribe_for_cleanup(trading_pair, generation))
         self._shutdown_unsubscribe_tasks[trading_pair] = task
+        self._shutdown_unsubscribe_generations[trading_pair] = generation
         self._track_task_for_drain(task)
         task.add_done_callback(
-            lambda completed, pair=trading_pair: self._subscription_cleanup_done(pair, completed)
+            lambda completed, pair=trading_pair, owner=generation: self._subscription_cleanup_done(
+                pair, owner, completed
+            )
         )
         return task
 
-    def _subscription_cleanup_done(self, trading_pair: str, task: asyncio.Task):
-        if self._shutdown_unsubscribe_tasks.get(trading_pair) is task:
+    def _subscription_cleanup_done(self, trading_pair: str, generation: int, task: asyncio.Task):
+        if (
+            self._shutdown_unsubscribe_tasks.get(trading_pair) is task
+            and self._shutdown_unsubscribe_generations.get(trading_pair) == generation
+        ):
             self._shutdown_unsubscribe_tasks.pop(trading_pair, None)
+            self._shutdown_unsubscribe_generations.pop(trading_pair, None)
 
-    async def _unsubscribe_for_cleanup(self, trading_pair: str) -> bool:
+    def _record_residual_subscription(self, trading_pair: str, generation: int):
+        current_generation = self._dynamic_subscription_generations.get(trading_pair)
+        if current_generation is None or current_generation == generation:
+            self._residual_subscriptions.add(trading_pair)
+            self._residual_subscription_generations[trading_pair] = generation
+
+    async def _unsubscribe_for_cleanup(self, trading_pair: str, generation: int) -> bool:
         try:
             success = await self._data_source.unsubscribe_from_trading_pair(trading_pair)
         except asyncio.CancelledError:
-            self._residual_subscriptions.add(trading_pair)
+            self._record_residual_subscription(trading_pair, generation)
             raise
         except Exception:
-            self._residual_subscriptions.add(trading_pair)
+            self._record_residual_subscription(trading_pair, generation)
             self.logger().exception(f"Error cleaning up subscription for {trading_pair}")
             return False
         if success:
-            self._dynamic_subscriptions.discard(trading_pair)
-            self._residual_subscriptions.discard(trading_pair)
+            if self._dynamic_subscription_generations.get(trading_pair) == generation:
+                self._dynamic_subscriptions.discard(trading_pair)
+                self._dynamic_subscription_generations.pop(trading_pair, None)
+            if self._residual_subscription_generations.get(trading_pair) == generation:
+                self._residual_subscriptions.discard(trading_pair)
+                self._residual_subscription_generations.pop(trading_pair, None)
         else:
-            self._residual_subscriptions.add(trading_pair)
+            self._record_residual_subscription(trading_pair, generation)
             self.logger().warning(f"Failed to clean up subscription for {trading_pair}")
         return success
 
-    async def _rollback_added_subscription(self, trading_pair: str):
-        cleanup_task = self._schedule_subscription_cleanup(trading_pair)
+    async def _rollback_added_subscription(self, trading_pair: str, generation: int):
+        cleanup_task = self._schedule_subscription_cleanup(trading_pair, generation)
         try:
             await asyncio.shield(cleanup_task)
         except asyncio.CancelledError:
@@ -623,7 +674,7 @@ class OrderBookTracker:
         for trading_pair, order_book in initialized_order_books.items():
             self._order_books[trading_pair] = order_book
             self._tracking_message_queues[trading_pair] = asyncio.Queue()
-            self._tracking_tasks[trading_pair] = safe_ensure_future(
+            self._tracking_tasks[trading_pair] = asyncio.ensure_future(
                 self._track_single_book(trading_pair, generation)
             )
         self._order_books_initialized.set()
@@ -669,24 +720,24 @@ class OrderBookTracker:
                     subscription_may_be_active = False
                 if self._caller_is_cancelling():
                     if subscription_may_be_active:
-                        await self._rollback_added_subscription(trading_pair)
+                        await self._rollback_added_subscription(trading_pair, generation)
                         subscription_may_be_active = False
                     raise asyncio.CancelledError
                 if not subscribe_success:
                     self.logger().error(f"Failed to subscribe to {trading_pair} WebSocket channels")
                     return False
                 if not self._is_generation_current(generation):
-                    await self._rollback_added_subscription(trading_pair)
+                    await self._rollback_added_subscription(trading_pair, generation)
                     subscription_may_be_active = False
                     return False
 
                 order_book = await self._initial_order_book_for_trading_pair(trading_pair)
                 if self._caller_is_cancelling():
-                    await self._rollback_added_subscription(trading_pair)
+                    await self._rollback_added_subscription(trading_pair, generation)
                     subscription_may_be_active = False
                     raise asyncio.CancelledError
                 if not self._is_generation_current(generation):
-                    await self._rollback_added_subscription(trading_pair)
+                    await self._rollback_added_subscription(trading_pair, generation)
                     subscription_may_be_active = False
                     return False
 
@@ -694,31 +745,33 @@ class OrderBookTracker:
                     self._trading_pairs.append(trading_pair)
                 self._order_books[trading_pair] = order_book
                 self._tracking_message_queues[trading_pair] = asyncio.Queue()
-                self._tracking_tasks[trading_pair] = safe_ensure_future(
+                self._tracking_tasks[trading_pair] = asyncio.ensure_future(
                     self._track_single_book(trading_pair, generation)
                 )
                 self._dynamic_subscriptions.add(trading_pair)
+                self._dynamic_subscription_generations[trading_pair] = generation
                 self._residual_subscriptions.discard(trading_pair)
+                self._residual_subscription_generations.pop(trading_pair, None)
                 subscription_may_be_active = False
                 self.logger().info(f"Successfully added trading pair {trading_pair} to order book tracker")
                 return True
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             if subscription_may_be_active:
                 try:
-                    await self._rollback_added_subscription(trading_pair)
+                    await self._rollback_added_subscription(trading_pair, generation)
                 except asyncio.CancelledError:
                     pass
                 except Exception:
                     self.logger().exception(
                         f"Error cleaning up subscription for cancelled trading pair add {trading_pair}"
                     )
-            if self._cancelled_only_by_tracker(transaction_task):
+            if self._cancelled_by_tracker(cancellation):
                 return False
             raise
         except Exception:
             self.logger().exception(f"Error adding trading pair {trading_pair}")
             if subscription_may_be_active:
-                await self._rollback_added_subscription(trading_pair)
+                await self._rollback_added_subscription(trading_pair, generation)
             if self._is_generation_current(generation):
                 self._remove_pair_locally(trading_pair)
             return False
@@ -726,7 +779,6 @@ class OrderBookTracker:
             self._data_source.reset_raw_message_generation(raw_generation_token)
             if transaction_task is not None:
                 self._in_flight_transactions.discard(transaction_task)
-                self._tracker_cancellation_counts.pop(transaction_task, None)
 
     async def remove_trading_pair(self, trading_pair: str) -> bool:
         """
@@ -757,7 +809,7 @@ class OrderBookTracker:
                 try:
                     unsubscribe_success = await self._data_source.unsubscribe_from_trading_pair(trading_pair)
                 except asyncio.CancelledError:
-                    self._residual_subscriptions.add(trading_pair)
+                    self._record_residual_subscription(trading_pair, generation)
                     raise
                 except Exception:
                     self.logger().exception(f"Error unsubscribing from trading pair {trading_pair}")
@@ -770,10 +822,14 @@ class OrderBookTracker:
                         raise asyncio.CancelledError
                     return False
 
-                self._dynamic_subscriptions.discard(trading_pair)
-                self._residual_subscriptions.discard(trading_pair)
-                tracking_task = self._remove_pair_locally(trading_pair)
                 generation_is_current = self._is_generation_current(generation)
+                if self._dynamic_subscription_generations.get(trading_pair) == generation:
+                    self._dynamic_subscriptions.discard(trading_pair)
+                    self._dynamic_subscription_generations.pop(trading_pair, None)
+                if self._residual_subscription_generations.get(trading_pair) == generation:
+                    self._residual_subscriptions.discard(trading_pair)
+                    self._residual_subscription_generations.pop(trading_pair, None)
+                tracking_task = self._remove_pair_locally(trading_pair) if generation_is_current else None
                 if caller_cancelled:
                     raise asyncio.CancelledError
 
@@ -794,15 +850,14 @@ class OrderBookTracker:
                     return False
                 self.logger().info(f"Successfully removed trading pair {trading_pair} from order book tracker")
                 return True
-        except asyncio.CancelledError:
-            if self._cancelled_only_by_tracker(transaction_task):
+        except asyncio.CancelledError as cancellation:
+            if self._cancelled_by_tracker(cancellation):
                 return False
             raise
         finally:
             self._data_source.reset_raw_message_generation(raw_generation_token)
             if transaction_task is not None:
                 self._in_flight_transactions.discard(transaction_task)
-                self._tracker_cancellation_counts.pop(transaction_task, None)
 
     def _message_for_generation(
         self, stream_item, generation: Optional[int]
