@@ -76,6 +76,56 @@ class _LifecycleProbeSource(OrderBookTrackerDataSource):
         raise NotImplementedError
 
 
+class _LateActivationSource(_LifecycleProbeSource):
+    def __init__(self):
+        super().__init__()
+        self.subscribe_entered = asyncio.Event()
+        self.subscribe_cancelled = asyncio.Event()
+        self.subscribe_release = asyncio.Event()
+        self.cleanup_completed = asyncio.Event()
+
+    async def subscribe_to_trading_pair(self, trading_pair):
+        self.subscribe_entered.set()
+        while not self.subscribe_release.is_set():
+            try:
+                await self.subscribe_release.wait()
+            except asyncio.CancelledError:
+                self.subscribe_cancelled.set()
+        self.remote_pairs.add(trading_pair)
+        self.add_trading_pair(trading_pair)
+        return True
+
+    async def unsubscribe_from_trading_pair(self, trading_pair):
+        self.unsubscribe_calls += 1
+        self.remote_pairs.discard(trading_pair)
+        self.remove_trading_pair(trading_pair)
+        self.cleanup_completed.set()
+        return True
+
+
+class _CallerFirstAddSource(_LifecycleProbeSource):
+    def __init__(self):
+        super().__init__()
+        self.snapshot_entered = asyncio.Event()
+        self.unsubscribe_started = asyncio.Event()
+        self.unsubscribe_release = asyncio.Event()
+
+    async def get_new_order_book(self, trading_pair):
+        self.snapshot_entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            return OrderBook()
+
+    async def unsubscribe_from_trading_pair(self, trading_pair):
+        self.unsubscribe_calls += 1
+        self.unsubscribe_started.set()
+        await self.unsubscribe_release.wait()
+        self.remote_pairs.discard(trading_pair)
+        self.remove_trading_pair(trading_pair)
+        return True
+
+
 class OrderBookTrackerGenerationTests(IsolatedAsyncioWrapperTestCase):
 
     @staticmethod
@@ -535,7 +585,10 @@ class OrderBookTrackerGenerationTests(IsolatedAsyncioWrapperTestCase):
             try:
                 await asyncio.Future()
             except asyncio.CancelledError:
-                asyncio.current_task().uncancel()
+                current_task = asyncio.current_task()
+                uncancel = getattr(current_task, "uncancel", None)
+                if uncancel is not None:
+                    uncancel()
                 tracker_cancel_consumed.set()
                 await asyncio.Future()
             return True
@@ -557,6 +610,119 @@ class OrderBookTrackerGenerationTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(1, source.unsubscribe_calls)
         self.assertTrue(await asyncio.wait_for(tracker.stop_and_wait(timeout=0.2), timeout=0.4))
         self.assertEqual(set(), tracker._tasks_to_drain)
+
+    async def test_clean_stop_waits_for_late_activation_before_single_cleanup(self):
+        pair = "LATE-ACTIVATION-USDT"
+        source = _LateActivationSource()
+        tracker = OrderBookTracker(data_source=source, trading_pairs=[])
+        tracker._sleep = AsyncMock()
+        tracker.start()
+        await asyncio.wait_for(tracker.wait_ready(), timeout=0.2)
+        add_task = asyncio.create_task(tracker.add_trading_pair(pair))
+        await asyncio.wait_for(source.subscribe_entered.wait(), timeout=0.2)
+        stop_task = asyncio.create_task(tracker.stop_and_wait(timeout=1.0))
+        await asyncio.wait_for(source.subscribe_cancelled.wait(), timeout=0.2)
+
+        try:
+            await asyncio.sleep(0)
+            self.assertFalse(source.cleanup_completed.is_set())
+            self.assertEqual(0, source.unsubscribe_calls)
+            self.assertIn(pair, tracker._dynamic_subscriptions)
+
+            source.subscribe_release.set()
+            add_result, stop_result = await asyncio.gather(add_task, stop_task)
+
+            self.assertFalse(add_result)
+            self.assertTrue(stop_result)
+            self.assertEqual(1, source.unsubscribe_calls)
+            self.assertNotIn(pair, source.remote_pairs)
+            self.assertNotIn(pair, tracker._dynamic_subscriptions)
+            self.assertEqual(frozenset(), tracker.residual_subscriptions)
+        finally:
+            source.subscribe_release.set()
+            await asyncio.gather(add_task, stop_task, return_exceptions=True)
+
+    async def test_stop_timeout_keeps_late_activation_owned_until_cleanup_finishes(self):
+        pair = "LATE-TIMEOUT-USDT"
+        source = _LateActivationSource()
+        tracker = OrderBookTracker(data_source=source, trading_pairs=[])
+        tracker._sleep = AsyncMock()
+        tracker.start()
+        await asyncio.wait_for(tracker.wait_ready(), timeout=0.2)
+        add_task = asyncio.create_task(tracker.add_trading_pair(pair))
+        await asyncio.wait_for(source.subscribe_entered.wait(), timeout=0.2)
+        stop_task = asyncio.create_task(tracker.stop_and_wait(timeout=0.02))
+        await asyncio.wait_for(source.subscribe_cancelled.wait(), timeout=0.2)
+
+        try:
+            self.assertFalse(await stop_task)
+            self.assertIn(pair, tracker._dynamic_subscriptions)
+            self.assertEqual(0, source.unsubscribe_calls)
+            source.subscribe_release.set()
+            self.assertFalse(await asyncio.wait_for(add_task, timeout=0.2))
+            self.assertTrue(await asyncio.wait_for(tracker.stop_and_wait(timeout=0.2), timeout=0.4))
+            self.assertEqual(1, source.unsubscribe_calls)
+            self.assertNotIn(pair, source.remote_pairs)
+        finally:
+            source.subscribe_release.set()
+            await asyncio.gather(add_task, return_exceptions=True)
+            await tracker.stop_and_wait(timeout=0.2)
+
+    async def test_caller_then_tracker_cancellation_preserves_add_message(self):
+        pair = "CALLER-FIRST-ADD-USDT"
+        source = _CallerFirstAddSource()
+        tracker = OrderBookTracker(data_source=source, trading_pairs=[])
+        tracker._sleep = AsyncMock()
+        tracker.start()
+        await asyncio.wait_for(tracker.wait_ready(), timeout=0.2)
+        add_task = asyncio.create_task(tracker.add_trading_pair(pair))
+        await asyncio.wait_for(source.snapshot_entered.wait(), timeout=0.2)
+        add_task.cancel("caller-first-add")
+        await asyncio.wait_for(source.unsubscribe_started.wait(), timeout=0.2)
+        tracker.stop()
+
+        with self.assertRaises(asyncio.CancelledError) as raised:
+            await asyncio.wait_for(add_task, timeout=0.2)
+        self.assertEqual(("caller-first-add",), raised.exception.args)
+
+        source.unsubscribe_release.set()
+        self.assertTrue(await asyncio.wait_for(tracker.stop_and_wait(timeout=0.2), timeout=0.4))
+
+    async def test_caller_then_tracker_cancellation_preserves_remove_message(self):
+        pair = "CALLER-FIRST-REMOVE-USDT"
+        source = _LifecycleProbeSource()
+        tracker = OrderBookTracker(data_source=source, trading_pairs=[])
+        tracker._sleep = AsyncMock()
+        tracker.start()
+        await asyncio.wait_for(tracker.wait_ready(), timeout=0.2)
+        self.assertTrue(await tracker.add_trading_pair(pair))
+        child_cancelled = asyncio.Event()
+        child_release = asyncio.Event()
+
+        async def cancellation_resistant_unsubscribe(trading_pair):
+            source.unsubscribe_calls += 1
+            if source.unsubscribe_calls == 1:
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    child_cancelled.set()
+                    await child_release.wait()
+            source.remote_pairs.discard(trading_pair)
+            source.remove_trading_pair(trading_pair)
+            return True
+
+        source.unsubscribe_from_trading_pair = cancellation_resistant_unsubscribe
+        remove_task = asyncio.create_task(tracker.remove_trading_pair(pair))
+        await asyncio.sleep(0)
+        remove_task.cancel("caller-first-remove")
+        await asyncio.wait_for(child_cancelled.wait(), timeout=0.2)
+        tracker.stop()
+        child_release.set()
+
+        with self.assertRaises(asyncio.CancelledError) as raised:
+            await asyncio.wait_for(remove_task, timeout=0.2)
+        self.assertEqual(("caller-first-remove",), raised.exception.args)
+        self.assertTrue(await asyncio.wait_for(tracker.stop_and_wait(timeout=0.2), timeout=0.4))
 
     async def test_direct_restart_fails_closed_while_dynamic_cleanup_is_pending(self):
         for replacement_pair in ("DYNAMIC-USDT", "OTHER-USDT"):
@@ -770,3 +936,17 @@ class OrderBookTrackerGenerationTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertLessEqual(len(source._retired_raw_message_generations), 1)
         self.assertEqual(0, len(tracker._pair_transaction_locks))
+
+    async def test_unbound_active_queue_proxy_metadata_is_weak_and_bounded(self):
+        source = _LifecycleProbeSource()
+        retained = source._message_queue["retained"]
+        for index in range(256):
+            transient = source._message_queue[f"transient-{index}"]
+        del transient
+        gc.collect()
+
+        self.assertLessEqual(len(source._unbound_raw_message_queues), 1)
+        source.activate_raw_message_generation(1)
+        source.deactivate_raw_message_generation(1)
+        source.activate_raw_message_generation(2)
+        self.assertIs(retained, source._message_queue["retained"])

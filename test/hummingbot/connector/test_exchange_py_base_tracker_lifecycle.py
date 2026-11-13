@@ -80,6 +80,37 @@ class _FailingStopConnector(_LifecycleHarnessBase):
         raise ValueError("override-cleanup")
 
 
+class _PostSuperFailingStartConnector(_LifecycleHarnessBase):
+    async def start_network(self):
+        await super().start_network()
+        self._status_polling_task = asyncio.create_task(asyncio.Event().wait())
+        self.post_super_task = self._status_polling_task
+        raise RuntimeError("post-super-start-failed: secret detail")
+
+    async def stop_network(self):
+        await super().stop_network()
+
+
+class _PreSuperFailingStartConnector(_LifecycleHarnessBase):
+    async def start_network(self):
+        self._status_polling_task = asyncio.create_task(asyncio.Event().wait())
+        self.pre_super_task = self._status_polling_task
+        raise RuntimeError("pre-super-start-failed: secret detail")
+
+    async def stop_network(self):
+        await super().stop_network()
+
+
+class _PreSuperCancelledStopConnector(_LifecycleHarnessBase):
+    async def start_network(self):
+        await super().start_network()
+
+    async def stop_network(self):
+        self.pre_super_entered.set()
+        await self.pre_super_release.wait()
+        await super().stop_network()
+
+
 for _connector_class in (
     _LifecycleHarnessBase,
     _PreSuperLifecycleConnector,
@@ -90,6 +121,9 @@ for _connector_class in (
     _NoBaseStartConnector,
     _NoBaseStopConnector,
     _FailingStopConnector,
+    _PostSuperFailingStartConnector,
+    _PreSuperFailingStartConnector,
+    _PreSuperCancelledStopConnector,
 ):
     _connector_class.__abstractmethods__ = frozenset()
 
@@ -242,6 +276,66 @@ class ExchangePyBaseTrackerLifecycleTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertIsInstance(raised.exception.__cause__, ValueError)
         tracker.stop.assert_called_once_with()
+
+    async def test_post_super_start_failure_fails_closed_with_stable_error(self):
+        tracker = MagicMock()
+        tracker.stop_and_wait = AsyncMock(return_value=True)
+        tracker.residual_subscriptions = frozenset()
+        connector = self._subclass_connector(_PostSuperFailingStartConnector, tracker)
+
+        with self.assertRaisesRegex(NetworkLifecycleError, "start_network override failed") as raised:
+            await connector.start_network()
+
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        self.assertNotIn("secret detail", str(raised.exception))
+        self.assertGreaterEqual(tracker.stop.call_count, 2)
+        self.assertIsNone(connector._status_polling_task)
+        self.assertTrue(connector.post_super_task.done())
+        self.assertEqual(set(), connector._network_tasks_to_drain)
+
+    async def test_pre_super_start_failure_fails_closed_with_stable_error(self):
+        tracker = MagicMock()
+        tracker.stop_and_wait = AsyncMock(return_value=True)
+        tracker.residual_subscriptions = frozenset()
+        connector = self._subclass_connector(_PreSuperFailingStartConnector, tracker)
+
+        with self.assertRaisesRegex(NetworkLifecycleError, "start_network override failed") as raised:
+            await connector.start_network()
+
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        self.assertNotIn("secret detail", str(raised.exception))
+        tracker.stop.assert_called_once_with()
+        self.assertIsNone(connector._status_polling_task)
+        self.assertTrue(connector.pre_super_task.done())
+        self.assertEqual(set(), connector._network_tasks_to_drain)
+
+    async def test_pre_super_stop_cancellation_preserves_message_and_fails_closed(self):
+        tracker = MagicMock()
+        tracker.stop_and_wait = AsyncMock(return_value=True)
+        tracker.residual_subscriptions = frozenset()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        connector = self._subclass_connector(
+            _PreSuperCancelledStopConnector,
+            tracker,
+            pre_super_entered=entered,
+            pre_super_release=release,
+        )
+        pending = asyncio.create_task(asyncio.Event().wait())
+        connector._status_polling_task = pending
+        stop_task = asyncio.create_task(connector.stop_network())
+        await asyncio.wait_for(entered.wait(), timeout=0.2)
+        stop_task.cancel("stop-caller-message")
+
+        with self.assertRaises(asyncio.CancelledError) as raised:
+            await asyncio.wait_for(stop_task, timeout=0.2)
+
+        self.assertEqual(("stop-caller-message",), raised.exception.args)
+        tracker.stop.assert_called_once_with()
+        tracker.stop_and_wait.assert_awaited_once_with()
+        self.assertIsNone(connector._status_polling_task)
+        self.assertTrue(pending.done())
+        release.set()
 
     async def test_public_stop_cancels_and_clears_registered_override_tasks(self):
         tracker = MagicMock()
@@ -427,18 +521,24 @@ class ExchangePyBaseTrackerLifecycleTests(IsolatedAsyncioWrapperTestCase):
     async def test_subclass_start_cancellation_releases_serializer_and_runs_stop_cleanup(self):
         tracker = MagicMock()
         tracker.stop_and_wait = AsyncMock(return_value=True)
+        tracker.residual_subscriptions = frozenset()
         connector = self._subclass_connector(
             _PreSuperLifecycleConnector,
             tracker,
             pre_super_entered=asyncio.Event(),
             pre_super_release=asyncio.Event(),
         )
+        pending = asyncio.create_task(asyncio.Event().wait())
+        connector._status_polling_task = pending
         start_task = asyncio.create_task(connector.start_network())
         await asyncio.wait_for(connector.pre_super_entered.wait(), timeout=0.2)
-        start_task.cancel()
+        start_task.cancel("start-caller-message")
 
-        with self.assertRaises(asyncio.CancelledError):
+        with self.assertRaises(asyncio.CancelledError) as raised:
             await asyncio.wait_for(start_task, timeout=0.2)
+        self.assertEqual(("start-caller-message",), raised.exception.args)
+        self.assertIsNone(connector._status_polling_task)
+        self.assertTrue(pending.done())
         await asyncio.wait_for(connector.stop_network(), timeout=0.2)
         self.assertGreaterEqual(tracker.stop.call_count, 1)
 

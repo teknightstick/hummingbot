@@ -77,6 +77,7 @@ class _NetworkStopState:
 class _NetworkLifecycleTransaction:
     generation: int
     base_start_called: bool = False
+    base_start_completed: bool = False
     base_stop_called: bool = False
 
 
@@ -841,22 +842,22 @@ class ExchangePyBase(ExchangeBase, ABC):
                 try:
                     try:
                         result = await method(connector, *args, **kwargs)
-                    except asyncio.CancelledError:
-                        if method_name == "start_network" and (
-                            transaction.base_start_called or not transaction.base_stop_called
-                        ):
-                            try:
-                                await ExchangePyBase.stop_network(connector)
-                            except asyncio.CancelledError:
-                                pass
-                            except Exception:
-                                ExchangePyBase.logger().exception(
-                                    "Error cleaning up a cancelled exchange network start."
-                                )
-                        raise
+                    except asyncio.CancelledError as cancellation:
+                        await ExchangePyBase._fail_closed_lifecycle_override(connector)
+                        raise cancellation
                     except Exception as exception:
-                        if method_name != "stop_network":
-                            raise
+                        if method_name == "start_network":
+                            await ExchangePyBase._fail_closed_lifecycle_override(connector)
+                            if (
+                                isinstance(exception, NetworkLifecycleError)
+                                and transaction.base_start_called
+                                and not transaction.base_start_completed
+                            ):
+                                raise exception
+                            await asyncio.sleep(0)
+                            raise NetworkLifecycleError(
+                                "Exchange start_network override failed; fail-closed cleanup was attempted."
+                            ) from exception
                         stop_state.clean = False
                         if not transaction.base_stop_called:
                             try:
@@ -897,6 +898,20 @@ class ExchangePyBase(ExchangeBase, ABC):
                             getattr(connector, "_network_stop_states", {}).pop(stop_task, None)
             finally:
                 ExchangePyBase._exit_network_lifecycle(connector, owns_transaction)
+
+    @staticmethod
+    async def _fail_closed_lifecycle_override(connector):
+        ExchangePyBase._cancel_network_drain_tasks(connector)
+        try:
+            await ExchangePyBase.stop_network(connector)
+        except asyncio.CancelledError:
+            # The triggering caller cancellation remains authoritative. A
+            # repeated cancellation must not replace it with cleanup state.
+            pass
+        except Exception:
+            ExchangePyBase.logger().exception(
+                "Error running fail-closed cleanup after a lifecycle override failure."
+            )
 
     @staticmethod
     def _enter_network_lifecycle(connector) -> Tuple[_NetworkLifecycleTransaction, bool]:
@@ -989,6 +1004,7 @@ class ExchangePyBase(ExchangeBase, ABC):
                         "await a clean stop_network() before retrying."
                     )
                 if not ExchangePyBase._network_lifecycle_is_current(self, generation):
+                    transaction.base_start_completed = True
                     return
                 self.order_book_tracker.start()
                 if self.is_trading_required:
@@ -1002,6 +1018,7 @@ class ExchangePyBase(ExchangeBase, ABC):
                     self._lost_orders_update_task = asyncio.ensure_future(
                         self._lost_orders_update_polling_loop()
                     )
+                transaction.base_start_completed = True
             finally:
                 ExchangePyBase._exit_network_lifecycle(self, owns_transaction)
 

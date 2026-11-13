@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Iterator, MutableMapping
 from contextvars import ContextVar, Token
 from typing import Any, Callable, Dict, List, Optional
+from weakref import WeakValueDictionary
 
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
@@ -57,6 +58,65 @@ class _DiscardingQueueMapping(MutableMapping[str, asyncio.Queue]):
         return 0
 
 
+class _ActiveGenerationQueue:
+    """Stable queue view for connector-lifetime consumers outside a generation context."""
+
+    def __init__(self, data_source: "OrderBookTrackerDataSource", key: str):
+        self._data_source = data_source
+        self._key = key
+        self._rotation = asyncio.Event()
+
+    def generation_rotated(self):
+        previous_rotation = self._rotation
+        self._rotation = asyncio.Event()
+        previous_rotation.set()
+
+    def _queue(self) -> asyncio.Queue:
+        return self._data_source._active_raw_message_queue(self._key)
+
+    async def put(self, item: Any):
+        await self._queue().put(item)
+
+    def put_nowait(self, item: Any):
+        return self._queue().put_nowait(item)
+
+    async def get(self):
+        while True:
+            generation = self._data_source._active_raw_message_generation
+            queue = self._queue()
+            rotation = self._rotation
+            get_task = asyncio.ensure_future(queue.get())
+            rotation_task = asyncio.ensure_future(rotation.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {get_task, rotation_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if (
+                    get_task in done
+                    and generation == self._data_source._active_raw_message_generation
+                    and not self._data_source._raw_message_generation_is_retired(generation)
+                ):
+                    return get_task.result()
+            finally:
+                for task in (get_task, rotation_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(get_task, rotation_task, return_exceptions=True)
+
+    def get_nowait(self):
+        return self._queue().get_nowait()
+
+    def empty(self) -> bool:
+        return self._queue().empty()
+
+    def qsize(self) -> int:
+        return self._queue().qsize()
+
+    def __getattr__(self, name: str):
+        return getattr(self._queue(), name)
+
+
 class _GenerationBoundMessageQueues(MutableMapping[str, asyncio.Queue]):
     """Mapping view that resolves raw queues from the producer task's session generation."""
 
@@ -67,6 +127,8 @@ class _GenerationBoundMessageQueues(MutableMapping[str, asyncio.Queue]):
         return self._data_source._raw_message_mapping_for_context()
 
     def __getitem__(self, key: str) -> asyncio.Queue:
+        if self._data_source._raw_message_queue_context.get() is _UNBOUND_RAW_QUEUE_GENERATION:
+            return self._data_source._unbound_raw_message_queue(key)
         return self._mapping()[key]
 
     def __setitem__(self, key: str, value: asyncio.Queue):
@@ -105,6 +167,7 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
             None: defaultdict(asyncio.Queue)
         }
         self._discarded_raw_message_queues: MutableMapping[str, asyncio.Queue] = _DiscardingQueueMapping()
+        self._unbound_raw_message_queues = WeakValueDictionary()
         self._message_queue_view = _GenerationBoundMessageQueues(self)
         self._ws_assistant: Optional[WSAssistant] = None
 
@@ -120,13 +183,16 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
         if self._raw_message_generation_is_retired(generation):
             return
         self._raw_message_queues[generation] = value
+        if generation == self._active_raw_message_generation:
+            self._wake_unbound_raw_message_queues()
 
     def activate_raw_message_generation(self, generation: int):
         """Create a fresh raw-frame queue set without changing the caller task's context."""
         if self._raw_message_generation_is_retired(generation):
             raise RuntimeError(f"Raw message generation {generation} has already been retired.")
-        self._active_raw_message_generation = generation
         self._raw_message_queues[generation] = defaultdict(asyncio.Queue)
+        self._active_raw_message_generation = generation
+        self._wake_unbound_raw_message_queues()
 
     def deactivate_raw_message_generation(self, generation: Optional[int]):
         """Retire raw queues before cancelling their producer and parser tasks."""
@@ -145,6 +211,7 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
             queues.clear()
         if self._active_raw_message_generation == generation:
             self._active_raw_message_generation = None
+        self._wake_unbound_raw_message_queues()
 
     def bind_raw_message_generation(self, generation: Optional[int]) -> Token:
         """Bind raw writes spawned by the current lifecycle transaction."""
@@ -169,6 +236,23 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
         if generation not in self._raw_message_queues:
             self._raw_message_queues[generation] = defaultdict(asyncio.Queue)
         return self._raw_message_queues[generation]
+
+    def _active_raw_message_queue(self, key: str) -> asyncio.Queue:
+        generation = self._active_raw_message_generation
+        if generation not in self._raw_message_queues:
+            self._raw_message_queues[generation] = defaultdict(asyncio.Queue)
+        return self._raw_message_queues[generation][key]
+
+    def _unbound_raw_message_queue(self, key: str) -> _ActiveGenerationQueue:
+        queue = self._unbound_raw_message_queues.get(key)
+        if queue is None:
+            queue = _ActiveGenerationQueue(self, key)
+            self._unbound_raw_message_queues[key] = queue
+        return queue
+
+    def _wake_unbound_raw_message_queues(self):
+        for queue in tuple(self._unbound_raw_message_queues.values()):
+            queue.generation_rotated()
 
     @classmethod
     def logger(cls) -> HummingbotLogger:

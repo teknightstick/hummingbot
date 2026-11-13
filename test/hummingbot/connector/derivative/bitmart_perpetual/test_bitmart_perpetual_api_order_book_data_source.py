@@ -483,6 +483,40 @@ class BitmartPerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
         self.assertIn(self.trading_pair, self.data_source._last_index_prices.keys())
         self.assertEqual(Decimal("146.28"), self.data_source._last_index_prices[self.trading_pair])
 
+    async def test_persistent_exchange_info_listener_follows_tracker_generation_restart(self):
+        processed = asyncio.Event()
+        original_parser = self.data_source._parse_exchange_info_message
+
+        async def parse_and_signal(raw_message):
+            await original_parser(raw_message)
+            processed.set()
+
+        listener_task = self.data_source._exchange_info_listener_task
+        await asyncio.sleep(0)
+        self.assertFalse(listener_task.done())
+
+        with patch.object(
+            self.data_source,
+            "_parse_exchange_info_message",
+            side_effect=parse_and_signal,
+        ):
+            self.data_source.activate_raw_message_generation(1)
+            cached_queue = self.data_source._message_queue[self.data_source._tickers_messages_queue_key]
+            self.data_source.deactivate_raw_message_generation(1)
+            self.data_source.activate_raw_message_generation(2)
+            current_queue = self.data_source._message_queue[self.data_source._tickers_messages_queue_key]
+
+            self.assertIs(cached_queue, current_queue)
+            current_queue.put_nowait(self._ticker_event())
+            await asyncio.wait_for(processed.wait(), timeout=0.2)
+
+        self.assertIs(listener_task, self.data_source._exchange_info_listener_task)
+        self.assertFalse(listener_task.done())
+        self.assertEqual(Decimal("146.24"), self.data_source._last_mark_prices[self.trading_pair])
+        self.assertEqual(Decimal("146.28"), self.data_source._last_index_prices[self.trading_pair])
+        listener_task.cancel()
+        await asyncio.gather(listener_task, return_exceptions=True)
+
     # Dynamic subscription tests for subscribe_to_trading_pair and unsubscribe_from_trading_pair
 
     async def test_subscribe_to_trading_pair_successful(self):

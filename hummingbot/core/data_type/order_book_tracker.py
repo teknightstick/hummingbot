@@ -53,7 +53,7 @@ class _GenerationBoundQueue:
 
 
 class _CancellationPreservingFuture(asyncio.Future):
-    """Forwards cancellation to a child without losing its latest message."""
+    """Forwards cancellation to a child without losing caller cancellation."""
 
     def __init__(self, awaitable):
         super().__init__()
@@ -76,10 +76,24 @@ class _CancellationPreservingFuture(asyncio.Future):
         else:
             self._child.cancel()
 
+    @property
+    def child(self) -> asyncio.Task:
+        return self._child
+
+    @staticmethod
+    def _is_tracker_cancellation(cancellation_args: tuple) -> bool:
+        return bool(cancellation_args) and cancellation_args[0] is _TRACKER_OWNED_CANCELLATION
+
     def cancel(self, msg=None):
         if self.done():
             return False
-        self._cancellation_args = () if msg is None else (msg,)
+        cancellation_args = () if msg is None else (msg,)
+        if (
+            self._cancellation_args is None
+            or not self._is_tracker_cancellation(cancellation_args)
+            or self._is_tracker_cancellation(self._cancellation_args)
+        ):
+            self._cancellation_args = cancellation_args
         if self._child_started:
             self._forward_cancellation()
         # Remain pending until the child has terminated. This lets a later
@@ -106,6 +120,12 @@ class _CancellationPreservingFuture(asyncio.Future):
                 self.set_result(child.result())
             except Exception as exception:
                 self.set_exception(exception)
+
+
+@dataclass(eq=False)
+class _SubscriptionIncarnation:
+    generation: int
+    activation: Optional[_CancellationPreservingFuture] = None
 
 
 @dataclass
@@ -615,6 +635,18 @@ class OrderBookTracker:
     def _cancelled_by_tracker(cancellation: asyncio.CancelledError) -> bool:
         return bool(cancellation.args) and cancellation.args[0] is _TRACKER_OWNED_CANCELLATION
 
+    @classmethod
+    def _preferred_cancellation(
+        cls,
+        earlier: asyncio.CancelledError,
+        later: asyncio.CancelledError,
+    ) -> asyncio.CancelledError:
+        if not cls._cancelled_by_tracker(later):
+            return later
+        if not cls._cancelled_by_tracker(earlier):
+            return earlier
+        return later
+
     async def _await_owned_operation(self, awaitable):
         """Drain a child operation while preserving the newest explicit cancellation."""
         return await _CancellationPreservingFuture(awaitable)
@@ -701,6 +733,46 @@ class OrderBookTracker:
     async def _unsubscribe_for_cleanup(
         self, trading_pair: str, generation: int, owner: object = None
     ) -> bool:
+        if isinstance(owner, _SubscriptionIncarnation) and owner.activation is not None:
+            activation = owner.activation
+            if not activation.done():
+                activation.cancel(_TRACKER_OWNED_CANCELLATION)
+                try:
+                    await asyncio.shield(activation)
+                except asyncio.CancelledError:
+                    if not activation.done():
+                        self._record_residual_subscription(trading_pair, generation, owner)
+                        raise
+                except Exception:
+                    pass
+
+            activation_child = activation.child
+            if not activation_child.done():
+                # Cleanup must never race an activation that can still finish
+                # remotely. Keep the incarnation owned and indexed until the
+                # child reaches a terminal state.
+                try:
+                    await asyncio.shield(activation_child)
+                except asyncio.CancelledError:
+                    if not activation_child.done():
+                        self._record_residual_subscription(trading_pair, generation, owner)
+                        raise
+                except Exception:
+                    pass
+
+            if not activation_child.done():
+                self._record_residual_subscription(trading_pair, generation, owner)
+                return False
+
+            if not activation_child.cancelled():
+                try:
+                    activation_succeeded = bool(activation_child.result())
+                except (asyncio.CancelledError, Exception):
+                    activation_succeeded = True
+                if not activation_succeeded:
+                    self._clear_subscription_ownership(trading_pair, generation, owner)
+                    return True
+
         try:
             success = await self._data_source.unsubscribe_from_trading_pair(trading_pair)
         except asyncio.CancelledError:
@@ -855,14 +927,15 @@ class OrderBookTracker:
                     return False
 
                 self.logger().info(f"Adding trading pair {trading_pair} to order book tracker...")
-                owner = object()
+                owner = _SubscriptionIncarnation(generation=generation)
                 self._dynamic_subscriptions.add(trading_pair)
                 self._dynamic_subscription_generations[trading_pair] = generation
                 self._dynamic_subscription_owners[trading_pair] = owner
                 subscription_may_be_active = True
-                subscribe_success = await self._await_owned_operation(
+                owner.activation = _CancellationPreservingFuture(
                     self._data_source.subscribe_to_trading_pair(trading_pair)
                 )
+                subscribe_success = await owner.activation
                 if not subscribe_success:
                     subscription_may_be_active = False
                     self._clear_subscription_ownership(trading_pair, generation, owner)
@@ -896,18 +969,21 @@ class OrderBookTracker:
                 self.logger().info(f"Successfully added trading pair {trading_pair} to order book tracker")
                 return True
         except asyncio.CancelledError as cancellation:
+            cancellation_to_raise = cancellation
             if subscription_may_be_active:
                 try:
                     await self._rollback_added_subscription(trading_pair, generation, owner)
-                except asyncio.CancelledError:
-                    raise
+                except asyncio.CancelledError as cleanup_cancellation:
+                    cancellation_to_raise = self._preferred_cancellation(
+                        cancellation_to_raise, cleanup_cancellation
+                    )
                 except Exception:
                     self.logger().exception(
                         f"Error cleaning up subscription for cancelled trading pair add {trading_pair}"
                     )
-            if self._cancelled_by_tracker(cancellation):
+            if self._cancelled_by_tracker(cancellation_to_raise):
                 return False
-            raise cancellation
+            raise cancellation_to_raise
         except Exception:
             self.logger().exception(f"Error adding trading pair {trading_pair}")
             if subscription_may_be_active:
