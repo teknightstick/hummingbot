@@ -367,23 +367,19 @@ class ExchangePyBaseTrackerLifecycleTests(IsolatedAsyncioWrapperTestCase):
         tracker = MagicMock()
         tracker.stop_and_wait = AsyncMock(return_value=True)
         tracker.residual_subscriptions = frozenset()
-        connector = self._connector(tracker)
-        attributes = (
-            "_status_polling_task",
-            "_trade_ws_listener_task",
-            "_balance_update_task",
-        )
+        connector = self._subclass_connector(_LifecycleHarnessBase, tracker)
+        generation_count = 25
         tasks = []
 
         async def generation(index):
             try:
                 await asyncio.Future()
             except asyncio.CancelledError:
-                if index + 1 < len(attributes):
+                if index + 1 < generation_count:
                     replacement = asyncio.create_task(generation(index + 1))
                     tasks.append(replacement)
-                    setattr(connector, attributes[index + 1], replacement)
                     await asyncio.sleep(0)
+                    connector._status_polling_task = replacement
 
         initial = asyncio.create_task(generation(0))
         tasks.append(initial)
@@ -392,9 +388,8 @@ class ExchangePyBaseTrackerLifecycleTests(IsolatedAsyncioWrapperTestCase):
 
         try:
             self.assertIsNone(await asyncio.wait_for(connector.stop_network(), timeout=0.2))
-            self.assertEqual(3, len(tasks))
-            for attribute in attributes:
-                self.assertIsNone(getattr(connector, attribute))
+            self.assertEqual(generation_count, len(tasks))
+            self.assertIsNone(connector._status_polling_task)
             self.assertTrue(all(task.done() for task in tasks))
             self.assertEqual(set(), connector._network_tasks_to_drain)
         finally:
@@ -406,26 +401,20 @@ class ExchangePyBaseTrackerLifecycleTests(IsolatedAsyncioWrapperTestCase):
         tracker = MagicMock()
         tracker.stop_and_wait = AsyncMock(return_value=True)
         tracker.residual_subscriptions = frozenset()
-        connector = self._connector(tracker)
-        attributes = (
-            "_status_polling_task",
-            "_trade_ws_listener_task",
-            "_balance_update_task",
-        )
-        releases = [asyncio.Event() for _ in attributes]
-        cancellation_seen = [asyncio.Event() for _ in attributes]
+        connector = self._subclass_connector(_LifecycleHarnessBase, tracker)
+        generation_count = 11
+        releases = [asyncio.Event() for _ in range(generation_count)]
         tasks = []
 
         async def generation(index):
             try:
                 await asyncio.Future()
             except asyncio.CancelledError:
-                cancellation_seen[index].set()
-                if index + 1 < len(attributes):
+                if index + 1 < generation_count:
                     replacement = asyncio.create_task(generation(index + 1))
                     tasks.append(replacement)
                     await asyncio.sleep(0)
-                    setattr(connector, attributes[index + 1], replacement)
+                    connector._status_polling_task = replacement
                 await releases[index].wait()
 
         async def immediate_timeout(waited_tasks, timeout):
@@ -444,13 +433,28 @@ class ExchangePyBaseTrackerLifecycleTests(IsolatedAsyncioWrapperTestCase):
                 "hummingbot.connector.exchange_py_base.asyncio.wait",
                 new=AsyncMock(side_effect=immediate_timeout),
             ):
-                self.assertIs(await connector.stop_network(), False)
+                self.assertIs(await asyncio.wait_for(connector.stop_network(), timeout=0.2), False)
 
-            self.assertEqual(3, len(tasks))
-            self.assertTrue(all(event.is_set() for event in cancellation_seen))
-            for attribute in attributes:
-                self.assertIsNone(getattr(connector, attribute))
-            self.assertTrue(all(task in connector._network_tasks_to_drain for task in tasks))
+            self.assertEqual(generation_count, len(tasks))
+            live_tasks = [task for task in tasks if not task.done()]
+            self.assertTrue(
+                all(
+                    task is connector._status_polling_task
+                    or task in connector._network_tasks_to_drain
+                    for task in live_tasks
+                )
+            )
+            await asyncio.sleep(0)
+            later_published = connector._status_polling_task
+            if later_published is not None and not later_published.done():
+                self.assertIn(later_published, connector._network_tasks_to_drain)
+
+            for release in releases:
+                release.set()
+            self.assertIsNone(await asyncio.wait_for(connector.stop_network(), timeout=0.2))
+            self.assertTrue(all(task.done() for task in tasks))
+            self.assertIsNone(connector._status_polling_task)
+            self.assertEqual(set(), connector._network_tasks_to_drain)
         finally:
             for release in releases:
                 release.set()

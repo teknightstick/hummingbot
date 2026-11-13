@@ -143,6 +143,17 @@ class ExchangePyBase(ExchangeBase, ABC):
         "_position_update_task",
         "_balance_refresh_task",
     )
+    _NETWORK_TASK_PUBLICATION_SETTLE_TIMEOUT = 0.05
+    _NETWORK_TASK_PUBLICATION_STABLE_SCANS = 3
+
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        if (
+            name in ExchangePyBase._NETWORK_TASK_ATTRIBUTES
+            and isinstance(value, asyncio.Future)
+            and getattr(self, "_network_task_publication_fence_active", False)
+        ):
+            ExchangePyBase._track_network_task(self, value)
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -185,6 +196,8 @@ class ExchangePyBase(ExchangeBase, ABC):
         self._network_tasks_to_drain: set[asyncio.Task] = _NetworkTaskRegistry()
         self._network_lifecycle_lock = _ReentrantNetworkLifecycleLock()
         self._network_stop_states: Dict[asyncio.Task, _NetworkStopState] = {}
+        self._network_task_publication_fence_active = False
+        self._network_task_publication_scan_depth = 0
 
         self._time_synchronizer = TimeSynchronizer()
         self._throttler = AsyncThrottler(
@@ -948,6 +961,20 @@ class ExchangePyBase(ExchangeBase, ABC):
         return registry
 
     @staticmethod
+    def _begin_network_task_publication_scan(connector):
+        connector._network_task_publication_fence_active = True
+        connector._network_task_publication_scan_depth = (
+            getattr(connector, "_network_task_publication_scan_depth", 0) + 1
+        )
+
+    @staticmethod
+    def _end_network_task_publication_scan(connector):
+        scan_depth = max(0, getattr(connector, "_network_task_publication_scan_depth", 1) - 1)
+        connector._network_task_publication_scan_depth = scan_depth
+        if scan_depth == 0 and not ExchangePyBase._network_task_registry(connector):
+            connector._network_task_publication_fence_active = False
+
+    @staticmethod
     def _invalidate_registered_network_tasks(connector) -> set[asyncio.Task]:
         invalidated = set()
         for attribute in ExchangePyBase._NETWORK_TASK_ATTRIBUTES:
@@ -979,8 +1006,11 @@ class ExchangePyBase(ExchangeBase, ABC):
 
     @staticmethod
     def _network_task_done(connector, task: asyncio.Task):
-        ExchangePyBase._network_task_registry(connector).discard(task)
+        registry = ExchangePyBase._network_task_registry(connector)
+        registry.discard(task)
         _retrieve_network_task_exception(task)
+        if not registry and getattr(connector, "_network_task_publication_scan_depth", 0) == 0:
+            connector._network_task_publication_fence_active = False
 
     async def start_network(self):
         """
@@ -1039,6 +1069,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         async with lifecycle_lock:
             transaction, owns_transaction = ExchangePyBase._enter_network_lifecycle(self)
             transaction.base_stop_called = True
+            ExchangePyBase._begin_network_task_publication_scan(self)
             try:
                 cleanup_tasks = []
                 clean = True
@@ -1094,19 +1125,32 @@ class ExchangePyBase(ExchangeBase, ABC):
                 if timed_out:
                     # A cancellation-resistant task may publish another
                     # registered generation as the deadline expires. Give
-                    # those cancellation handlers bounded event-loop turns so
-                    # every published handle is cleared, cancelled and kept in
-                    # the drain registry for the next retry.
-                    final_scan_limit = len(ExchangePyBase._NETWORK_TASK_ATTRIBUTES) + 1
+                    # those cancellation handlers a deadline-bounded
+                    # publication fixed point so every published handle is
+                    # cleared, cancelled and kept in the drain registry for
+                    # the next retry.
+                    publication_deadline = (
+                        asyncio.get_running_loop().time()
+                        + ExchangePyBase._NETWORK_TASK_PUBLICATION_SETTLE_TIMEOUT
+                    )
                     fixed_point_observations = 0
-                    for _ in range(final_scan_limit):
+                    previous_pending_tasks = None
+                    while asyncio.get_running_loop().time() < publication_deadline:
                         invalidated = ExchangePyBase._invalidate_registered_network_tasks(self)
-                        set(ExchangePyBase._network_task_registry(self))
-                        if invalidated:
+                        pending_tasks = frozenset(
+                            task
+                            for task in ExchangePyBase._network_task_registry(self)
+                            if not task.done()
+                        )
+                        if invalidated or pending_tasks != previous_pending_tasks:
                             fixed_point_observations = 0
                         else:
                             fixed_point_observations += 1
-                        if fixed_point_observations >= 2:
+                        previous_pending_tasks = pending_tasks
+                        if (
+                            fixed_point_observations
+                            >= ExchangePyBase._NETWORK_TASK_PUBLICATION_STABLE_SCANS
+                        ):
                             break
                         await asyncio.sleep(0)
                     remaining_tasks = set(ExchangePyBase._network_task_registry(self))
@@ -1147,6 +1191,7 @@ class ExchangePyBase(ExchangeBase, ABC):
                     ) from cleanup_error
                 return None if clean else False
             finally:
+                ExchangePyBase._end_network_task_publication_scan(self)
                 ExchangePyBase._exit_network_lifecycle(self, owns_transaction)
 
     async def add_trading_pair(self, trading_pair: str) -> bool:

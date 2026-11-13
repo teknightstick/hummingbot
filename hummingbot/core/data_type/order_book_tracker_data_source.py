@@ -318,8 +318,9 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
                 )
                 await self._sleep(1.0)
             finally:
-                self._ws_assistant = None  # Clear reference on disconnect
                 await self._on_order_stream_interruption(websocket_assistant=ws)
+                if self._ws_assistant is ws:
+                    self._ws_assistant = None
 
     async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         """

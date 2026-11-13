@@ -23,6 +23,42 @@ from hummingbot.core.data_type.funding_info import FundingInfo
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.order_book_tracker import OrderBookTracker
+from hummingbot.core.web_assistant.ws_assistant import WSAssistant
+
+
+class _DeterministicClosingConnection:
+    _MAX_MSG_SIZE = 4 * 1024 * 1024
+
+    def __init__(self):
+        self.connected = False
+        self.closing = False
+        self.receive_started = asyncio.Event()
+        self.close_started = asyncio.Event()
+        self.close_release = asyncio.Event()
+        self.sent_payloads = []
+
+    async def connect(self, **kwargs):
+        self.connected = True
+        self.closing = False
+
+    async def disconnect(self):
+        self.closing = True
+        self.close_started.set()
+        await self.close_release.wait()
+        self.connected = False
+        self.closing = False
+
+    async def send(self, request):
+        if self.closing:
+            raise ConnectionError("WebSocket close is pending")
+        await request.send_with_connection(self)
+
+    async def receive(self):
+        self.receive_started.set()
+        await asyncio.Future()
+
+    async def _send_json(self, payload):
+        self.sent_payloads.append(payload)
 
 
 class BitmartPerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
@@ -621,11 +657,9 @@ class BitmartPerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
             bidict({self.ex_trading_pair: self.trading_pair, "ETHUSDT": dynamic_pair})
         )
         self.data_source.get_new_order_book = AsyncMock(return_value=OrderBook())
-
-        async def listen_until_cancelled():
-            await asyncio.Future()
-
-        self.data_source.listen_for_subscriptions = AsyncMock(side_effect=listen_until_cancelled)
+        connection = _DeterministicClosingConnection()
+        assistant = WSAssistant(connection=connection)
+        self.data_source._api_factory.get_ws_assistant = AsyncMock(return_value=assistant)
         tracker = OrderBookTracker(
             data_source=self.data_source,
             trading_pairs=[self.trading_pair],
@@ -636,15 +670,29 @@ class BitmartPerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
 
         try:
             await asyncio.wait_for(tracker.wait_ready(), timeout=0.2)
-            self.data_source._ws_assistant = AsyncMock()
+            await asyncio.wait_for(connection.receive_started.wait(), timeout=0.2)
             self.assertTrue(await tracker.add_trading_pair(dynamic_pair))
             self.assertIn(dynamic_pair, self.data_source._trading_pairs)
+            sends_before_stop = len(connection.sent_payloads)
 
-            # The real subscription listener clears this reference before the
-            # tracker schedules dynamic unsubscribe cleanup.
-            self.data_source._ws_assistant = None
+            stop_task = asyncio.create_task(tracker.stop_and_wait(timeout=0.02))
+            await asyncio.wait_for(connection.close_started.wait(), timeout=0.2)
+            self.assertFalse(await stop_task)
+            self.assertTrue(connection.connected)
+            self.assertIs(assistant, self.data_source._ws_assistant)
+            self.assertIn(dynamic_pair, tracker._dynamic_subscriptions)
+            self.assertIn(dynamic_pair, tracker.residual_subscriptions)
+            self.assertIn(dynamic_pair, tracker._trading_pairs)
+            self.assertIn(dynamic_pair, self.data_source._trading_pairs)
+
+            connection.close_release.set()
+            for _ in range(10):
+                if self.data_source._ws_assistant is None:
+                    break
+                await asyncio.sleep(0)
+            self.assertIsNone(self.data_source._ws_assistant)
             self.assertTrue(await tracker.stop_and_wait(timeout=0.2))
-            self.assertTrue(await tracker.stop_and_wait(timeout=0.2))
+            self.assertEqual(sends_before_stop, len(connection.sent_payloads))
             self.assertNotIn(dynamic_pair, tracker.residual_subscriptions)
             self.assertNotIn(dynamic_pair, tracker._trading_pairs)
             self.assertNotIn(dynamic_pair, self.data_source._trading_pairs)
@@ -653,8 +701,7 @@ class BitmartPerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
             await asyncio.wait_for(tracker.wait_ready(), timeout=0.2)
             self.assertNotIn(dynamic_pair, tracker._trading_pairs)
         finally:
-            if tracker.residual_subscriptions:
-                self.data_source._ws_assistant = AsyncMock()
+            connection.close_release.set()
             await tracker.stop_and_wait(timeout=0.2)
 
     async def test_unsubscribe_from_trading_pair_raises_cancel_exception(self):
