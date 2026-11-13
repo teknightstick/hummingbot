@@ -38,6 +38,29 @@ def create_order_book_with_snapshot_uid(snapshot_uid: int) -> OrderBook:
     return ob
 
 
+class _RawFrameDataSource(OrderBookTrackerDataSource):
+    async def get_last_traded_prices(self, trading_pairs, domain=None):
+        await asyncio.Future()
+
+    async def _parse_order_book_diff_message(self, raw_message, message_queue):
+        message_queue.put_nowait(OrderBookMessage(
+            message_type=OrderBookMessageType.DIFF,
+            content={
+                "trading_pair": raw_message["trading_pair"],
+                "update_id": raw_message["update_id"],
+                "bids": [],
+                "asks": [],
+            },
+            timestamp=time.time(),
+        ))
+
+    async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
+        return True
+
+    async def unsubscribe_from_trading_pair(self, trading_pair: str) -> bool:
+        return True
+
+
 class LatencyStatsTests(unittest.TestCase):
     """Tests for the LatencyStats dataclass."""
 
@@ -759,8 +782,8 @@ class OrderBookTrackerDynamicPairTests(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(result)
         self.data_source.unsubscribe_from_trading_pair.assert_not_called()
 
-    async def test_remove_trading_pair_unsubscribe_fails_continues_cleanup(self):
-        """Test that cleanup continues even if unsubscribe fails."""
+    async def test_remove_trading_pair_unsubscribe_failure_preserves_state_for_retry(self):
+        """A failed remote unsubscribe must leave the locally tracked pair coherent."""
         tracker = self._create_tracker()
         tracker._metrics.tracker_start_time = time.perf_counter()
         tracker._order_books_initialized.set()
@@ -771,14 +794,29 @@ class OrderBookTrackerDynamicPairTests(IsolatedAsyncioWrapperTestCase):
         tracker._tracking_message_queues[pair_to_remove] = asyncio.Queue()
         tracker._trading_pairs.append(pair_to_remove)
 
-        # Mock unsubscribe to fail
-        self.data_source.unsubscribe_from_trading_pair = AsyncMock(return_value=False)
+        async def tracking():
+            await asyncio.Future()
 
-        result = await tracker.remove_trading_pair(pair_to_remove)
+        tracking_task = asyncio.create_task(tracking())
+        tracker._tracking_tasks[pair_to_remove] = tracking_task
 
-        # Should still return True as cleanup was done
-        self.assertTrue(result)
+        self.data_source.unsubscribe_from_trading_pair = AsyncMock(side_effect=[False, True])
+
+        first_result = await tracker.remove_trading_pair(pair_to_remove)
+
+        self.assertFalse(first_result)
+        self.assertIn(pair_to_remove, tracker._order_books)
+        self.assertIn(pair_to_remove, tracker._tracking_message_queues)
+        self.assertIs(tracking_task, tracker._tracking_tasks[pair_to_remove])
+        self.assertIn(pair_to_remove, tracker._trading_pairs)
+        self.assertFalse(tracking_task.done())
+
+        second_result = await tracker.remove_trading_pair(pair_to_remove)
+
+        self.assertTrue(second_result)
         self.assertNotIn(pair_to_remove, tracker._order_books)
+        self.assertNotIn(pair_to_remove, tracker._tracking_tasks)
+        self.assertEqual(2, self.data_source.unsubscribe_from_trading_pair.await_count)
 
     async def test_remove_trading_pair_raises_cancel_exception(self):
         """Test that CancelledError is properly propagated during removal."""
@@ -825,6 +863,456 @@ class OrderBookTrackerDynamicPairTests(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(result)
         self.assertNotIn(pair_to_remove, tracker._past_diffs_windows)
         self.assertNotIn(pair_to_remove, tracker._saved_message_queues)
+
+
+class OrderBookTrackerLifecycleRemediationTests(IsolatedAsyncioWrapperTestCase):
+    pair = "REMEDIATION-USDT"
+
+    @staticmethod
+    def _mock_source():
+        source = MagicMock(spec=OrderBookTrackerDataSource)
+        source.get_new_order_book = AsyncMock(return_value=OrderBook())
+        source.subscribe_to_trading_pair = AsyncMock(return_value=True)
+        source.unsubscribe_from_trading_pair = AsyncMock(return_value=True)
+        return source
+
+    async def _ready_tracker(self, source=None):
+        tracker = OrderBookTracker(data_source=source or self._mock_source(), trading_pairs=[])
+        tracker.start()
+        await tracker.wait_ready()
+        return tracker
+
+    async def test_stop_and_wait_owns_and_rolls_back_in_flight_add(self):
+        source = self._mock_source()
+        remote_active = False
+        snapshot_started = asyncio.Event()
+        snapshot_release = asyncio.Event()
+
+        async def subscribe(_pair):
+            nonlocal remote_active
+            remote_active = True
+            return True
+
+        async def snapshot(_pair):
+            snapshot_started.set()
+            await snapshot_release.wait()
+            return OrderBook()
+
+        async def unsubscribe(_pair):
+            nonlocal remote_active
+            remote_active = False
+            return True
+
+        source.subscribe_to_trading_pair.side_effect = subscribe
+        source.get_new_order_book.side_effect = snapshot
+        source.unsubscribe_from_trading_pair.side_effect = unsubscribe
+        tracker = await self._ready_tracker(source)
+        add_task = asyncio.create_task(tracker.add_trading_pair(self.pair))
+        await snapshot_started.wait()
+
+        try:
+            self.assertTrue(await tracker.stop_and_wait(timeout=0.2))
+            self.assertTrue(add_task.done())
+            self.assertFalse(await add_task)
+            self.assertFalse(remote_active)
+            source.unsubscribe_from_trading_pair.assert_awaited_once_with(self.pair)
+            self.assertNotIn(self.pair, tracker.order_books)
+            self.assertNotIn(self.pair, tracker._tracking_message_queues)
+            self.assertNotIn(self.pair, tracker._tracking_tasks)
+        finally:
+            snapshot_release.set()
+            add_task.cancel()
+            await asyncio.gather(add_task, return_exceptions=True)
+
+    async def test_duplicate_add_has_one_owner_and_one_false_waiter(self):
+        source = self._mock_source()
+        subscribe_started = asyncio.Event()
+        subscribe_release = asyncio.Event()
+        subscribe_calls = 0
+
+        async def subscribe(_pair):
+            nonlocal subscribe_calls
+            subscribe_calls += 1
+            subscribe_started.set()
+            await subscribe_release.wait()
+            return True
+
+        source.subscribe_to_trading_pair.side_effect = subscribe
+        tracker = await self._ready_tracker(source)
+        owner = asyncio.create_task(tracker.add_trading_pair(self.pair))
+        await subscribe_started.wait()
+        waiter = asyncio.create_task(tracker.add_trading_pair(self.pair))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        try:
+            self.assertEqual(1, subscribe_calls)
+            subscribe_release.set()
+            self.assertEqual([True, False], await asyncio.gather(owner, waiter))
+            self.assertEqual(1, source.get_new_order_book.await_count)
+            self.assertIn(self.pair, tracker.order_books)
+            self.assertIn(self.pair, tracker._tracking_message_queues)
+            self.assertIn(self.pair, tracker._tracking_tasks)
+        finally:
+            subscribe_release.set()
+            await asyncio.gather(owner, waiter, return_exceptions=True)
+            await tracker.stop_and_wait(timeout=0.2)
+
+    async def test_duplicate_add_waiter_cancellation_does_not_cancel_owner(self):
+        source = self._mock_source()
+        subscribe_started = asyncio.Event()
+        subscribe_release = asyncio.Event()
+
+        async def subscribe(_pair):
+            subscribe_started.set()
+            await subscribe_release.wait()
+            return True
+
+        source.subscribe_to_trading_pair.side_effect = subscribe
+        tracker = await self._ready_tracker(source)
+        owner = asyncio.create_task(tracker.add_trading_pair(self.pair))
+        await subscribe_started.wait()
+        waiter = asyncio.create_task(tracker.add_trading_pair(self.pair))
+        await asyncio.sleep(0)
+        waiter.cancel()
+
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                await waiter
+            self.assertFalse(owner.done())
+            self.assertEqual(1, source.subscribe_to_trading_pair.await_count)
+            subscribe_release.set()
+            self.assertTrue(await owner)
+        finally:
+            subscribe_release.set()
+            await asyncio.gather(owner, waiter, return_exceptions=True)
+            await tracker.stop_and_wait(timeout=0.2)
+
+    async def test_different_pair_adds_can_progress_concurrently(self):
+        source = self._mock_source()
+        both_started = asyncio.Event()
+        release = asyncio.Event()
+        started_pairs = set()
+
+        async def subscribe(pair):
+            started_pairs.add(pair)
+            if len(started_pairs) == 2:
+                both_started.set()
+            await release.wait()
+            return True
+
+        source.subscribe_to_trading_pair.side_effect = subscribe
+        tracker = await self._ready_tracker(source)
+        first = asyncio.create_task(tracker.add_trading_pair("FIRST-USDT"))
+        second = asyncio.create_task(tracker.add_trading_pair("SECOND-USDT"))
+
+        try:
+            await asyncio.wait_for(both_started.wait(), timeout=0.2)
+            release.set()
+            self.assertEqual([True, True], await asyncio.gather(first, second))
+            self.assertEqual({"FIRST-USDT", "SECOND-USDT"}, started_pairs)
+        finally:
+            release.set()
+            await asyncio.gather(first, second, return_exceptions=True)
+            await tracker.stop_and_wait(timeout=0.2)
+
+    async def test_duplicate_remove_has_one_owner_and_one_false_waiter(self):
+        source = self._mock_source()
+        unsubscribe_started = asyncio.Event()
+        unsubscribe_release = asyncio.Event()
+
+        async def unsubscribe(_pair):
+            unsubscribe_started.set()
+            await unsubscribe_release.wait()
+            return True
+
+        source.unsubscribe_from_trading_pair.side_effect = unsubscribe
+        tracker = await self._ready_tracker(source)
+        tracker._order_books[self.pair] = OrderBook()
+        tracker._tracking_message_queues[self.pair] = asyncio.Queue()
+        tracker._trading_pairs.append(self.pair)
+
+        async def tracking():
+            await asyncio.Future()
+
+        tracker._tracking_tasks[self.pair] = asyncio.create_task(tracking())
+        owner = asyncio.create_task(tracker.remove_trading_pair(self.pair))
+        await unsubscribe_started.wait()
+        waiter = asyncio.create_task(tracker.remove_trading_pair(self.pair))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        try:
+            self.assertEqual(1, source.unsubscribe_from_trading_pair.await_count)
+            unsubscribe_release.set()
+            self.assertEqual([True, False], await asyncio.gather(owner, waiter))
+            self.assertNotIn(self.pair, tracker.order_books)
+            self.assertNotIn(self.pair, tracker._tracking_tasks)
+        finally:
+            unsubscribe_release.set()
+            await asyncio.gather(owner, waiter, return_exceptions=True)
+            await tracker.stop_and_wait(timeout=0.2)
+
+    async def test_add_and_remove_same_pair_are_serialized(self):
+        source = self._mock_source()
+        subscribe_started = asyncio.Event()
+        subscribe_release = asyncio.Event()
+
+        async def subscribe(_pair):
+            subscribe_started.set()
+            await subscribe_release.wait()
+            return True
+
+        source.subscribe_to_trading_pair.side_effect = subscribe
+        tracker = await self._ready_tracker(source)
+        add_task = asyncio.create_task(tracker.add_trading_pair(self.pair))
+        await subscribe_started.wait()
+        remove_task = asyncio.create_task(tracker.remove_trading_pair(self.pair))
+        await asyncio.sleep(0)
+
+        try:
+            self.assertFalse(remove_task.done())
+            subscribe_release.set()
+            self.assertEqual([True, True], await asyncio.gather(add_task, remove_task))
+            self.assertEqual(1, source.subscribe_to_trading_pair.await_count)
+            self.assertEqual(1, source.unsubscribe_from_trading_pair.await_count)
+            self.assertNotIn(self.pair, tracker.order_books)
+        finally:
+            subscribe_release.set()
+            await asyncio.gather(add_task, remove_task, return_exceptions=True)
+            await tracker.stop_and_wait(timeout=0.2)
+
+    async def test_unsubscribe_exception_preserves_state_for_retry(self):
+        source = self._mock_source()
+        source.unsubscribe_from_trading_pair.side_effect = [RuntimeError("offline"), True]
+        tracker = await self._ready_tracker(source)
+        tracker._order_books[self.pair] = OrderBook()
+        tracker._tracking_message_queues[self.pair] = asyncio.Queue()
+        tracker._trading_pairs.append(self.pair)
+
+        self.assertFalse(await tracker.remove_trading_pair(self.pair))
+        self.assertIn(self.pair, tracker.order_books)
+        self.assertIn(self.pair, tracker._tracking_message_queues)
+        self.assertIn(self.pair, tracker._trading_pairs)
+
+        self.assertTrue(await tracker.remove_trading_pair(self.pair))
+        self.assertNotIn(self.pair, tracker.order_books)
+        tracker.stop()
+
+    async def test_shutdown_reports_and_retries_residual_dynamic_subscription(self):
+        source = self._mock_source()
+        remote_active = False
+        unsubscribe_succeeds = False
+
+        async def subscribe(_pair):
+            nonlocal remote_active
+            remote_active = True
+            return True
+
+        async def unsubscribe(_pair):
+            nonlocal remote_active
+            if unsubscribe_succeeds:
+                remote_active = False
+                return True
+            return False
+
+        source.subscribe_to_trading_pair.side_effect = subscribe
+        source.unsubscribe_from_trading_pair.side_effect = unsubscribe
+        tracker = await self._ready_tracker(source)
+        self.assertTrue(await tracker.add_trading_pair(self.pair))
+        await asyncio.sleep(0)
+
+        self.assertFalse(await tracker.stop_and_wait(timeout=0.2))
+        self.assertTrue(remote_active)
+        self.assertIn(self.pair, tracker.residual_subscriptions)
+
+        unsubscribe_succeeds = True
+        self.assertTrue(await tracker.stop_and_wait(timeout=0.2))
+        self.assertFalse(remote_active)
+        self.assertNotIn(self.pair, tracker.residual_subscriptions)
+
+    async def test_remove_distinguishes_child_from_caller_cancellation(self):
+        source = self._mock_source()
+        first_cancel = asyncio.Event()
+        child_release = asyncio.Event()
+
+        async def cancellation_resistant_tracking():
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                first_cancel.set()
+                await child_release.wait()
+
+        tracker = await self._ready_tracker(source)
+        tracker._order_books[self.pair] = OrderBook()
+        tracker._tracking_message_queues[self.pair] = asyncio.Queue()
+        tracker._trading_pairs.append(self.pair)
+        child = asyncio.create_task(cancellation_resistant_tracking())
+        tracker._tracking_tasks[self.pair] = child
+        remove_task = asyncio.create_task(tracker.remove_trading_pair(self.pair))
+        await first_cancel.wait()
+        remove_task.cancel()
+
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                await remove_task
+            self.assertNotIn(self.pair, tracker.order_books)
+            self.assertIn(child, tracker._tasks_to_drain)
+        finally:
+            child_release.set()
+            child.cancel()
+            await asyncio.gather(child, remove_task, return_exceptions=True)
+            tracker.stop()
+
+    async def test_add_propagates_cancellation_swallowed_by_subscription(self):
+        source = self._mock_source()
+        subscribe_started = asyncio.Event()
+        remote_active = False
+
+        async def cancellation_resistant_subscribe(_pair):
+            nonlocal remote_active
+            subscribe_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                remote_active = True
+                return True
+
+        async def unsubscribe(_pair):
+            nonlocal remote_active
+            remote_active = False
+            return True
+
+        source.subscribe_to_trading_pair.side_effect = cancellation_resistant_subscribe
+        source.unsubscribe_from_trading_pair.side_effect = unsubscribe
+        tracker = await self._ready_tracker(source)
+        add_task = asyncio.create_task(tracker.add_trading_pair(self.pair))
+        await subscribe_started.wait()
+        add_task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await add_task
+        for _ in range(5):
+            if not remote_active:
+                break
+            await asyncio.sleep(0)
+        self.assertFalse(remote_active)
+        self.assertNotIn(self.pair, tracker.order_books)
+        tracker.stop()
+
+    async def test_stop_and_wait_propagates_cancellation_without_losing_drain_index(self):
+        source = self._mock_source()
+        tracking_cancelled = asyncio.Event()
+        tracking_release = asyncio.Event()
+
+        async def cancellation_resistant_tracking():
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                tracking_cancelled.set()
+                await tracking_release.wait()
+
+        tracker = await self._ready_tracker(source)
+        tracking_task = asyncio.create_task(cancellation_resistant_tracking())
+        tracker._tracking_tasks[self.pair] = tracking_task
+        stop_task = asyncio.create_task(tracker.stop_and_wait(timeout=1.0))
+        await tracking_cancelled.wait()
+        stop_task.cancel()
+
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                await stop_task
+            self.assertIn(tracking_task, tracker._tasks_to_drain)
+            self.assertFalse(tracking_task.done())
+        finally:
+            tracking_release.set()
+            tracking_task.cancel()
+            await asyncio.gather(tracking_task, stop_task, return_exceptions=True)
+
+    async def test_stale_raw_frame_queued_before_replacement_is_not_redecoded(self):
+        source = _RawFrameDataSource(trading_pairs=[])
+
+        async def blocked_subscriptions():
+            await asyncio.Future()
+
+        source.listen_for_subscriptions = AsyncMock(side_effect=blocked_subscriptions)
+        tracker = await self._ready_tracker(source)
+        source._message_queue[source._diff_messages_queue_key].put_nowait(
+            {"trading_pair": "STALE-USDT", "update_id": 1}
+        )
+        tracker.stop()
+        tracker.start()
+        await tracker.wait_ready()
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        self.assertNotIn("STALE-USDT", tracker._saved_message_queues)
+        self.assertEqual(0, tracker.metrics.total_diffs_queued)
+        tracker.stop()
+
+    async def test_raw_frame_emitted_during_cancelled_add_rollback_is_stale(self):
+        source = _RawFrameDataSource(trading_pairs=[])
+        snapshot_started = asyncio.Event()
+
+        async def blocked_subscriptions():
+            await asyncio.Future()
+
+        source.listen_for_subscriptions = AsyncMock(side_effect=blocked_subscriptions)
+
+        async def snapshot_after_cancellation(_pair):
+            snapshot_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                source._message_queue[source._diff_messages_queue_key].put_nowait(
+                    {"trading_pair": "ROLLBACK-USDT", "update_id": 2}
+                )
+                return OrderBook()
+
+        source.get_new_order_book = AsyncMock(side_effect=snapshot_after_cancellation)
+        tracker = await self._ready_tracker(source)
+        add_task = asyncio.create_task(tracker.add_trading_pair(self.pair))
+        await snapshot_started.wait()
+        tracker.stop()
+        add_task.cancel()
+        await asyncio.gather(add_task, return_exceptions=True)
+        tracker.start()
+        await tracker.wait_ready()
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        self.assertNotIn("ROLLBACK-USDT", tracker._saved_message_queues)
+        tracker.stop()
+
+    async def test_raw_frame_from_cancellation_suppressing_old_session_is_stale(self):
+        source = _RawFrameDataSource(trading_pairs=[])
+        old_session_started = asyncio.Event()
+        subscription_calls = 0
+
+        async def subscriptions():
+            nonlocal subscription_calls
+            subscription_calls += 1
+            if subscription_calls == 1:
+                old_session_started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    source._message_queue[source._diff_messages_queue_key].put_nowait(
+                        {"trading_pair": "OLD-SESSION-USDT", "update_id": 3}
+                    )
+                    return
+            await asyncio.Future()
+
+        source.listen_for_subscriptions = AsyncMock(side_effect=subscriptions)
+        tracker = await self._ready_tracker(source)
+        await old_session_started.wait()
+        tracker.start()
+        await tracker.wait_ready()
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        self.assertNotIn("OLD-SESSION-USDT", tracker._saved_message_queues)
+        tracker.stop()
 
 
 class LatencyStatsEdgeCasesTests(unittest.TestCase):

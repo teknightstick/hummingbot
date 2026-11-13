@@ -3,12 +3,61 @@ import logging
 import time
 from abc import ABCMeta, abstractmethod
 from collections import defaultdict
+from collections.abc import Iterator, MutableMapping
+from contextvars import ContextVar, Token
 from typing import Any, Callable, Dict, List, Optional
 
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
+
+
+_UNBOUND_RAW_QUEUE_GENERATION = object()
+
+
+class _DiscardingQueue:
+    """Queue-shaped sink used by producers from retired websocket sessions."""
+
+    async def put(self, item: Any):
+        return None
+
+    def put_nowait(self, item: Any):
+        return None
+
+    async def get(self):
+        await asyncio.Future()
+
+    def empty(self) -> bool:
+        return True
+
+    def qsize(self) -> int:
+        return 0
+
+
+class _GenerationBoundMessageQueues(MutableMapping[str, asyncio.Queue]):
+    """Mapping view that resolves raw queues from the producer task's session generation."""
+
+    def __init__(self, data_source: "OrderBookTrackerDataSource"):
+        self._data_source = data_source
+
+    def _mapping(self) -> MutableMapping[str, asyncio.Queue]:
+        return self._data_source._raw_message_mapping_for_context()
+
+    def __getitem__(self, key: str) -> asyncio.Queue:
+        return self._mapping()[key]
+
+    def __setitem__(self, key: str, value: asyncio.Queue):
+        self._mapping()[key] = value
+
+    def __delitem__(self, key: str):
+        del self._mapping()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._mapping())
+
+    def __len__(self) -> int:
+        return len(self._mapping())
 
 
 class OrderBookTrackerDataSource(metaclass=ABCMeta):
@@ -23,8 +72,66 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
 
         self._trading_pairs: List[str] = trading_pairs
         self._order_book_create_function = lambda: OrderBook()
-        self._message_queue: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
+        self._raw_message_queue_context: ContextVar = ContextVar(
+            f"raw_message_queue_generation_{id(self)}",
+            default=_UNBOUND_RAW_QUEUE_GENERATION,
+        )
+        self._active_raw_message_generation: Optional[int] = None
+        self._retired_raw_message_generations: set[int] = set()
+        self._raw_message_queues: Dict[Optional[int], MutableMapping[str, asyncio.Queue]] = {
+            None: defaultdict(asyncio.Queue)
+        }
+        self._discarded_raw_message_queues: MutableMapping[str, asyncio.Queue] = defaultdict(_DiscardingQueue)
+        self._message_queue_view = _GenerationBoundMessageQueues(self)
         self._ws_assistant: Optional[WSAssistant] = None
+
+    @property
+    def _message_queue(self) -> MutableMapping[str, asyncio.Queue]:
+        return self._message_queue_view
+
+    @_message_queue.setter
+    def _message_queue(self, value: MutableMapping[str, asyncio.Queue]):
+        generation = self._raw_message_queue_context.get()
+        if generation is _UNBOUND_RAW_QUEUE_GENERATION:
+            generation = self._active_raw_message_generation
+        self._raw_message_queues[generation] = value
+
+    def activate_raw_message_generation(self, generation: int):
+        """Create and bind a fresh raw-frame queue set for a tracker generation."""
+        self._active_raw_message_generation = generation
+        self._retired_raw_message_generations.discard(generation)
+        self._raw_message_queues[generation] = defaultdict(asyncio.Queue)
+        self._raw_message_queue_context.set(generation)
+
+    def deactivate_raw_message_generation(self, generation: Optional[int]):
+        """Retire raw queues before cancelling their producer and parser tasks."""
+        if generation is None:
+            return
+        self._retired_raw_message_generations.add(generation)
+        queues = self._raw_message_queues.pop(generation, None)
+        if queues is not None:
+            queues.clear()
+        if self._active_raw_message_generation == generation:
+            self._active_raw_message_generation = None
+        if self._raw_message_queue_context.get() == generation:
+            self._raw_message_queue_context.set(_UNBOUND_RAW_QUEUE_GENERATION)
+
+    def bind_raw_message_generation(self, generation: Optional[int]) -> Token:
+        """Bind raw writes spawned by the current lifecycle transaction."""
+        return self._raw_message_queue_context.set(generation)
+
+    def reset_raw_message_generation(self, token: Token):
+        self._raw_message_queue_context.reset(token)
+
+    def _raw_message_mapping_for_context(self) -> MutableMapping[str, asyncio.Queue]:
+        generation = self._raw_message_queue_context.get()
+        if generation is _UNBOUND_RAW_QUEUE_GENERATION:
+            generation = self._active_raw_message_generation
+        if generation in self._retired_raw_message_generations:
+            return self._discarded_raw_message_queues
+        if generation not in self._raw_message_queues:
+            self._raw_message_queues[generation] = defaultdict(asyncio.Queue)
+        return self._raw_message_queues[generation]
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
