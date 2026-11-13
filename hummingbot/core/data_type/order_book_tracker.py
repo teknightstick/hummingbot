@@ -22,6 +22,29 @@ class OrderBookTrackerDataSourceType(Enum):
     EXCHANGE_API = 3
 
 
+@dataclass(frozen=True)
+class _OrderBookMessageEnvelope:
+    generation: int
+    message: OrderBookMessage
+
+
+class _GenerationBoundQueue:
+    """Output-only queue view that binds listener messages to one tracker generation."""
+
+    def __init__(self, queue: asyncio.Queue, generation: int):
+        self._queue = queue
+        self._generation = generation
+
+    async def put(self, message: OrderBookMessage):
+        await self._queue.put(_OrderBookMessageEnvelope(self._generation, message))
+
+    def put_nowait(self, message: OrderBookMessage):
+        return self._queue.put_nowait(_OrderBookMessageEnvelope(self._generation, message))
+
+    def __getattr__(self, name: str):
+        return getattr(self._queue, name)
+
+
 @dataclass
 class LatencyStats:
     """
@@ -252,6 +275,9 @@ class OrderBookTracker:
         self._order_book_trade_stream: asyncio.Queue = asyncio.Queue()
         self._ev_loop: asyncio.BaseEventLoop = asyncio.get_event_loop()
         self._saved_message_queues: Dict[str, Deque[OrderBookMessage]] = defaultdict(lambda: deque(maxlen=1000))
+        self._generation: int = 0
+        self._active_generation: Optional[int] = None
+        self._tasks_to_drain: set[asyncio.Task] = set()
 
         self._emit_trade_event_task: Optional[asyncio.Task] = None
         self._init_order_books_task: Optional[asyncio.Task] = None
@@ -292,36 +318,64 @@ class OrderBookTracker:
 
     def start(self):
         self.stop()
+        generation = self._generation
+        self._active_generation = generation
         self._metrics.tracker_start_time = time.perf_counter()
         self._init_order_books_task = safe_ensure_future(
-            self._init_order_books()
+            self._init_order_books(generation)
         )
         self._emit_trade_event_task = safe_ensure_future(
-            self._emit_trade_event_loop()
+            self._emit_trade_event_loop(generation)
         )
         self._order_book_diff_listener_task = safe_ensure_future(
-            self._data_source.listen_for_order_book_diffs(self._ev_loop, self._order_book_diff_stream)
+            self._data_source.listen_for_order_book_diffs(
+                self._ev_loop, _GenerationBoundQueue(self._order_book_diff_stream, generation)
+            )
         )
         self._order_book_trade_listener_task = safe_ensure_future(
-            self._data_source.listen_for_trades(self._ev_loop, self._order_book_trade_stream)
+            self._data_source.listen_for_trades(
+                self._ev_loop, _GenerationBoundQueue(self._order_book_trade_stream, generation)
+            )
         )
         self._order_book_snapshot_listener_task = safe_ensure_future(
-            self._data_source.listen_for_order_book_snapshots(self._ev_loop, self._order_book_snapshot_stream)
+            self._data_source.listen_for_order_book_snapshots(
+                self._ev_loop, _GenerationBoundQueue(self._order_book_snapshot_stream, generation)
+            )
         )
         self._order_book_stream_listener_task = safe_ensure_future(
             self._data_source.listen_for_subscriptions()
         )
         self._order_book_diff_router_task = safe_ensure_future(
-            self._order_book_diff_router()
+            self._order_book_diff_router(generation)
         )
         self._order_book_snapshot_router_task = safe_ensure_future(
-            self._order_book_snapshot_router()
+            self._order_book_snapshot_router(generation)
         )
         self._update_last_trade_prices_task = safe_ensure_future(
-            self._update_last_trade_prices_loop()
+            self._update_last_trade_prices_loop(generation)
         )
 
     def stop(self):
+        tasks_to_drain = [
+            task for task in (
+                self._init_order_books_task,
+                self._emit_trade_event_task,
+                self._order_book_diff_listener_task,
+                self._order_book_trade_listener_task,
+                self._order_book_snapshot_listener_task,
+                self._order_book_diff_router_task,
+                self._order_book_snapshot_router_task,
+                self._update_last_trade_prices_task,
+                self._order_book_stream_listener_task,
+                *self._tracking_tasks.values(),
+            ) if task is not None
+        ]
+        self._generation += 1
+        self._active_generation = None
+        self._order_books_initialized.clear()
+        self._order_book_diff_stream = asyncio.Queue()
+        self._order_book_snapshot_stream = asyncio.Queue()
+        self._order_book_trade_stream = asyncio.Queue()
         if self._init_order_books_task is not None:
             self._init_order_books_task.cancel()
             self._init_order_books_task = None
@@ -349,23 +403,63 @@ class OrderBookTracker:
             self._update_last_trade_prices_task = None
         if self._order_book_stream_listener_task is not None:
             self._order_book_stream_listener_task.cancel()
+            self._order_book_stream_listener_task = None
         if len(self._tracking_tasks) > 0:
             for _, task in self._tracking_tasks.items():
                 task.cancel()
             self._tracking_tasks.clear()
-        self._order_books_initialized.clear()
+        self._order_books.clear()
+        self._tracking_message_queues.clear()
+        self._saved_message_queues.clear()
+        self._past_diffs_windows.clear()
+        for task in tasks_to_drain:
+            if not task.done():
+                self._tasks_to_drain.add(task)
+                task.add_done_callback(self._generation_task_done)
+
+    def _generation_task_done(self, task: asyncio.Task):
+        self._tasks_to_drain.discard(task)
+        if task.cancelled():
+            return
+        try:
+            exception = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exception is not None:
+            self.logger().error(
+                "Error while draining an order book tracker generation.",
+                exc_info=(type(exception), exception, exception.__traceback__),
+            )
+
+    async def stop_and_wait(self, timeout: float = 10.0) -> bool:
+        """Stop immediately, then wait up to ``timeout`` seconds for owned tasks to drain."""
+        self.stop()
+        tasks = set(self._tasks_to_drain)
+        if not tasks:
+            return True
+        _, pending = await asyncio.wait(tasks, timeout=timeout)
+        if pending:
+            self.logger().warning(
+                f"Timed out draining {len(pending)} order book tracker task(s) after {timeout:.1f} seconds."
+            )
+            return False
+        return True
 
     async def wait_ready(self):
         await self._order_books_initialized.wait()
 
-    async def _update_last_trade_prices_loop(self):
+    async def _update_last_trade_prices_loop(self, generation: Optional[int] = None):
         '''
         Updates last trade price for all order books through REST API, it is to initiate last_trade_price and as
         fall-back mechanism for when the web socket update channel fails.
         '''
         await self._order_books_initialized.wait()
+        if not self._is_generation_current(generation):
+            return
         while True:
             try:
+                if not self._is_generation_current(generation):
+                    return
                 outdateds = [t_pair for t_pair, o_book in self._order_books.items()
                              if o_book.last_applied_trade < time.perf_counter() - (60. * 3)
                              and o_book.last_trade_price_rest_updated < time.perf_counter() - 5]
@@ -374,9 +468,13 @@ class OrderBookTracker:
                     if self._domain is not None:
                         args["domain"] = self._domain
                     last_prices = await self._data_source.get_last_traded_prices(**args)
+                    if not self._is_generation_current(generation):
+                        return
                     for trading_pair, last_price in last_prices.items():
-                        self._order_books[trading_pair].last_trade_price = last_price
-                        self._order_books[trading_pair].last_trade_price_rest_updated = time.perf_counter()
+                        order_book = self._order_books.get(trading_pair)
+                        if order_book is not None:
+                            order_book.last_trade_price = last_price
+                            order_book.last_trade_price_rest_updated = time.perf_counter()
                 else:
                     await asyncio.sleep(1)
             except asyncio.CancelledError:
@@ -388,17 +486,28 @@ class OrderBookTracker:
     async def _initial_order_book_for_trading_pair(self, trading_pair: str) -> OrderBook:
         return await self._data_source.get_new_order_book(trading_pair)
 
-    async def _init_order_books(self):
+    async def _init_order_books(self, generation: Optional[int] = None):
         """
         Initialize order books
         """
-        for index, trading_pair in enumerate(self._trading_pairs):
-            self._order_books[trading_pair] = await self._initial_order_book_for_trading_pair(trading_pair)
-            self._tracking_message_queues[trading_pair] = asyncio.Queue()
-            self._tracking_tasks[trading_pair] = safe_ensure_future(self._track_single_book(trading_pair))
+        trading_pairs = tuple(self._trading_pairs)
+        initialized_order_books: Dict[str, OrderBook] = {}
+        for index, trading_pair in enumerate(trading_pairs):
+            order_book = await self._initial_order_book_for_trading_pair(trading_pair)
+            if generation is not None and generation != self._active_generation:
+                return
+            initialized_order_books[trading_pair] = order_book
             self.logger().info(f"Initialized order book for {trading_pair}. "
-                               f"{index + 1}/{len(self._trading_pairs)} completed.")
+                               f"{index + 1}/{len(trading_pairs)} completed.")
             await self._sleep(delay=1)
+            if generation is not None and generation != self._active_generation:
+                return
+        for trading_pair, order_book in initialized_order_books.items():
+            self._order_books[trading_pair] = order_book
+            self._tracking_message_queues[trading_pair] = asyncio.Queue()
+            self._tracking_tasks[trading_pair] = safe_ensure_future(
+                self._track_single_book(trading_pair, generation)
+            )
         self._order_books_initialized.set()
 
     async def add_trading_pair(self, trading_pair: str) -> bool:
@@ -415,6 +524,8 @@ class OrderBookTracker:
         :param trading_pair: the trading pair to add (e.g., "BTC-USDT")
         :return: True if successfully added, False otherwise
         """
+        generation = self._active_generation
+
         # Check if already tracking this pair
         if trading_pair in self._order_books:
             self.logger().warning(f"Trading pair {trading_pair} is already being tracked")
@@ -422,7 +533,10 @@ class OrderBookTracker:
 
         # Wait for initial order books to be ready before adding new ones
         await self._order_books_initialized.wait()
+        if not self._is_generation_current(generation):
+            return False
 
+        subscribed = False
         try:
             self.logger().info(f"Adding trading pair {trading_pair} to order book tracker...")
 
@@ -432,34 +546,48 @@ class OrderBookTracker:
             if not subscribe_success:
                 self.logger().error(f"Failed to subscribe to {trading_pair} WebSocket channels")
                 return False
+            subscribed = True
+            if not self._is_generation_current(generation):
+                return False
 
-            # Step 2: Add to internal trading pairs list
+            # Step 2: Fetch the initial snapshot without publishing partial state.
+            # Note: Diffs received during this time are saved in _saved_message_queues
+            order_book = await self._initial_order_book_for_trading_pair(trading_pair)
+            if not self._is_generation_current(generation):
+                return False
+
+            # Step 3: Commit the pair to the same generation atomically.
             if trading_pair not in self._trading_pairs:
                 self._trading_pairs.append(trading_pair)
-
-            # Step 3: Fetch initial snapshot and create order book
-            # Note: Diffs received during this time are saved in _saved_message_queues
-            self._order_books[trading_pair] = await self._initial_order_book_for_trading_pair(trading_pair)
-
-            # Step 4: Create message queue and start tracking task
+            self._order_books[trading_pair] = order_book
             self._tracking_message_queues[trading_pair] = asyncio.Queue()
             self._tracking_tasks[trading_pair] = safe_ensure_future(
-                self._track_single_book(trading_pair)
+                self._track_single_book(trading_pair, generation)
             )
 
             self.logger().info(f"Successfully added trading pair {trading_pair} to order book tracker")
             return True
 
         except asyncio.CancelledError:
+            if subscribed and self._is_generation_current(generation):
+                try:
+                    await self._data_source.unsubscribe_from_trading_pair(trading_pair)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.logger().exception(
+                        f"Error cleaning up subscription for cancelled trading pair add {trading_pair}"
+                    )
             raise
         except Exception:
             self.logger().exception(f"Error adding trading pair {trading_pair}")
             # Clean up partial state
-            self._order_books.pop(trading_pair, None)
-            self._tracking_message_queues.pop(trading_pair, None)
-            if trading_pair in self._tracking_tasks:
-                self._tracking_tasks[trading_pair].cancel()
-                self._tracking_tasks.pop(trading_pair, None)
+            if self._is_generation_current(generation):
+                self._order_books.pop(trading_pair, None)
+                self._tracking_message_queues.pop(trading_pair, None)
+                if trading_pair in self._tracking_tasks:
+                    self._tracking_tasks[trading_pair].cancel()
+                    self._tracking_tasks.pop(trading_pair, None)
             return False
 
     async def remove_trading_pair(self, trading_pair: str) -> bool:
@@ -474,25 +602,33 @@ class OrderBookTracker:
         :param trading_pair: the trading pair to remove (e.g., "SOL-USDT")
         :return: True if successfully removed, False otherwise
         """
+        generation = self._active_generation
+
         # Check if we're tracking this pair
         if trading_pair not in self._order_books:
             self.logger().warning(f"Trading pair {trading_pair} is not being tracked")
             return False
 
         try:
+            if not self._is_generation_current(generation):
+                return False
             self.logger().info(f"Removing trading pair {trading_pair} from order book tracker...")
 
             # Step 1: Cancel the tracking task
-            if trading_pair in self._tracking_tasks:
-                self._tracking_tasks[trading_pair].cancel()
+            tracking_task = self._tracking_tasks.pop(trading_pair, None)
+            if tracking_task is not None:
+                tracking_task.cancel()
                 try:
-                    await self._tracking_tasks[trading_pair]
+                    await tracking_task
                 except asyncio.CancelledError:
                     pass
-                self._tracking_tasks.pop(trading_pair, None)
+                if not self._is_generation_current(generation):
+                    return False
 
             # Step 2: Unsubscribe from WebSocket channels
             unsubscribe_success = await self._data_source.unsubscribe_from_trading_pair(trading_pair)
+            if not self._is_generation_current(generation):
+                return False
             if not unsubscribe_success:
                 self.logger().warning(f"Failed to unsubscribe from {trading_pair} WebSocket channels")
                 # Continue with cleanup anyway
@@ -519,7 +655,24 @@ class OrderBookTracker:
             self.logger().exception(f"Error removing trading pair {trading_pair}")
             return False
 
-    async def _order_book_diff_router(self):
+    def _message_for_generation(
+        self, stream_item, generation: Optional[int]
+    ) -> Optional[OrderBookMessage]:
+        if generation is None:
+            if isinstance(stream_item, _OrderBookMessageEnvelope):
+                if stream_item.generation != self._active_generation:
+                    return None
+                return stream_item.message
+            return stream_item
+        if generation != self._active_generation:
+            return None
+        if not isinstance(stream_item, _OrderBookMessageEnvelope):
+            return None
+        if stream_item.generation != generation:
+            return None
+        return stream_item.message
+
+    async def _order_book_diff_router(self, generation: Optional[int] = None):
         """
         Routes the real-time order book diff messages to the correct order book.
         """
@@ -533,7 +686,10 @@ class OrderBookTracker:
 
         while True:
             try:
-                ob_message: OrderBookMessage = await self._order_book_diff_stream.get()
+                stream_item = await self._order_book_diff_stream.get()
+                ob_message = self._message_for_generation(stream_item, generation)
+                if ob_message is None:
+                    continue
                 process_start = time.perf_counter()
                 trading_pair: str = ob_message.trading_pair
 
@@ -590,18 +746,23 @@ class OrderBookTracker:
                 )
                 await asyncio.sleep(5.0)
 
-    async def _order_book_snapshot_router(self):
+    async def _order_book_snapshot_router(self, generation: Optional[int] = None):
         """
         Route the real-time order book snapshot messages to the correct order book.
         """
         await self._order_books_initialized.wait()
+        if generation is not None and generation != self._active_generation:
+            return
 
         # Cache pair_metrics references
         pair_metrics_cache: Dict[str, OrderBookPairMetrics] = {}
 
         while True:
             try:
-                ob_message: OrderBookMessage = await self._order_book_snapshot_stream.get()
+                stream_item = await self._order_book_snapshot_stream.get()
+                ob_message = self._message_for_generation(stream_item, generation)
+                if ob_message is None:
+                    continue
                 process_start = time.perf_counter()
                 trading_pair: str = ob_message.trading_pair
 
@@ -631,7 +792,12 @@ class OrderBookTracker:
                 self.logger().error("Unknown error. Retrying after 5 seconds.", exc_info=True)
                 await asyncio.sleep(5.0)
 
-    async def _track_single_book(self, trading_pair: str):
+    def _is_generation_current(self, generation: Optional[int]) -> bool:
+        return generation == self._active_generation
+
+    async def _track_single_book(self, trading_pair: str, generation: Optional[int] = None):
+        if not self._is_generation_current(generation):
+            return
         past_diffs_window = self._past_diffs_windows[trading_pair]
 
         message_queue: asyncio.Queue = self._tracking_message_queues[trading_pair]
@@ -641,6 +807,8 @@ class OrderBookTracker:
 
         while True:
             try:
+                if not self._is_generation_current(generation):
+                    return
                 saved_messages: Deque[OrderBookMessage] = self._saved_message_queues[trading_pair]
 
                 # Process saved messages first if there are any
@@ -648,6 +816,8 @@ class OrderBookTracker:
                     message = saved_messages.popleft()
                 else:
                     message = await message_queue.get()
+                    if not self._is_generation_current(generation):
+                        return
 
                 if message.type is OrderBookMessageType.DIFF:
                     order_book.apply_diffs(message.bids, message.asks, message.update_id)
@@ -673,18 +843,23 @@ class OrderBookTracker:
                 )
                 await asyncio.sleep(5.0)
 
-    async def _emit_trade_event_loop(self):
+    async def _emit_trade_event_loop(self, generation: Optional[int] = None):
         last_message_timestamp: float = time.time()
         messages_accepted: int = 0
         messages_rejected: int = 0
         await self._order_books_initialized.wait()
+        if generation is not None and generation != self._active_generation:
+            return
 
         # Cache pair_metrics references
         pair_metrics_cache: Dict[str, OrderBookPairMetrics] = {}
 
         while True:
             try:
-                trade_message: OrderBookMessage = await self._order_book_trade_stream.get()
+                stream_item = await self._order_book_trade_stream.get()
+                trade_message = self._message_for_generation(stream_item, generation)
+                if trade_message is None:
+                    continue
                 process_start = time.perf_counter()
                 trading_pair: str = trade_message.trading_pair
 
