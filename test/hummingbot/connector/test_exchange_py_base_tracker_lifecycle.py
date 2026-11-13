@@ -1,7 +1,7 @@
 import asyncio
 import inspect
 from types import MethodType, SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 
@@ -362,6 +362,101 @@ class ExchangePyBaseTrackerLifecycleTests(IsolatedAsyncioWrapperTestCase):
             self.assertIsNone(getattr(connector, attribute))
             self.assertTrue(task.done(), attribute)
         self.assertEqual(set(), connector._network_tasks_to_drain)
+
+    async def test_stop_rescans_multiple_late_registered_task_generations(self):
+        tracker = MagicMock()
+        tracker.stop_and_wait = AsyncMock(return_value=True)
+        tracker.residual_subscriptions = frozenset()
+        connector = self._connector(tracker)
+        attributes = (
+            "_status_polling_task",
+            "_trade_ws_listener_task",
+            "_balance_update_task",
+        )
+        tasks = []
+
+        async def generation(index):
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                if index + 1 < len(attributes):
+                    replacement = asyncio.create_task(generation(index + 1))
+                    tasks.append(replacement)
+                    setattr(connector, attributes[index + 1], replacement)
+                    await asyncio.sleep(0)
+
+        initial = asyncio.create_task(generation(0))
+        tasks.append(initial)
+        connector._status_polling_task = initial
+        await asyncio.sleep(0)
+
+        try:
+            self.assertIsNone(await asyncio.wait_for(connector.stop_network(), timeout=0.2))
+            self.assertEqual(3, len(tasks))
+            for attribute in attributes:
+                self.assertIsNone(getattr(connector, attribute))
+            self.assertTrue(all(task.done() for task in tasks))
+            self.assertEqual(set(), connector._network_tasks_to_drain)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_stop_timeout_indexes_every_late_registered_task_generation(self):
+        tracker = MagicMock()
+        tracker.stop_and_wait = AsyncMock(return_value=True)
+        tracker.residual_subscriptions = frozenset()
+        connector = self._connector(tracker)
+        attributes = (
+            "_status_polling_task",
+            "_trade_ws_listener_task",
+            "_balance_update_task",
+        )
+        releases = [asyncio.Event() for _ in attributes]
+        cancellation_seen = [asyncio.Event() for _ in attributes]
+        tasks = []
+
+        async def generation(index):
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancellation_seen[index].set()
+                if index + 1 < len(attributes):
+                    replacement = asyncio.create_task(generation(index + 1))
+                    tasks.append(replacement)
+                    await asyncio.sleep(0)
+                    setattr(connector, attributes[index + 1], replacement)
+                await releases[index].wait()
+
+        async def immediate_timeout(waited_tasks, timeout):
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return set(), {task for task in waited_tasks if not task.done()}
+
+        initial = asyncio.create_task(generation(0))
+        tasks.append(initial)
+        connector._status_polling_task = initial
+        await asyncio.sleep(0)
+
+        try:
+            with patch(
+                "hummingbot.connector.exchange_py_base.asyncio.wait",
+                new=AsyncMock(side_effect=immediate_timeout),
+            ):
+                self.assertIs(await connector.stop_network(), False)
+
+            self.assertEqual(3, len(tasks))
+            self.assertTrue(all(event.is_set() for event in cancellation_seen))
+            for attribute in attributes:
+                self.assertIsNone(getattr(connector, attribute))
+            self.assertTrue(all(task in connector._network_tasks_to_drain for task in tasks))
+        finally:
+            for release in releases:
+                release.set()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def test_completed_network_task_is_pruned_when_its_loop_stops_before_callbacks(self):
         connector = MagicMock()

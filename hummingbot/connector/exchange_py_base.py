@@ -1041,7 +1041,6 @@ class ExchangePyBase(ExchangeBase, ABC):
             transaction.base_stop_called = True
             try:
                 cleanup_tasks = []
-                owned_tasks_to_wait = set(ExchangePyBase._network_task_registry(self))
                 clean = True
                 # Invalidate every task index synchronously before the first await.
                 self._last_poll_timestamp = 0
@@ -1049,41 +1048,72 @@ class ExchangePyBase(ExchangeBase, ABC):
                 self._poll_notifier = asyncio.Event()
                 self.order_book_tracker.stop()
 
-                owned_tasks_to_wait.update(ExchangePyBase._invalidate_registered_network_tasks(self))
-
                 tracker_drain_task = asyncio.ensure_future(self.order_book_tracker.stop_and_wait())
                 cleanup_tasks.append(tracker_drain_task)
                 ExchangePyBase._track_network_task(self, tracker_drain_task)
-                owned_tasks_to_wait.add(tracker_drain_task)
 
                 user_stream_tracker = getattr(self, "_user_stream_tracker", None)
                 if user_stream_tracker is not None:
                     user_stream_stop_task = asyncio.ensure_future(user_stream_tracker.stop())
                     cleanup_tasks.append(user_stream_stop_task)
                     ExchangePyBase._track_network_task(self, user_stream_stop_task)
-                    owned_tasks_to_wait.add(user_stream_stop_task)
 
                 deadline = asyncio.get_running_loop().time() + 10.0
-                while any(not task.done() for task in owned_tasks_to_wait):
+                fixed_point_observed = False
+                timed_out = False
+                while True:
+                    invalidated = ExchangePyBase._invalidate_registered_network_tasks(self)
+                    tasks_to_wait = set(ExchangePyBase._network_task_registry(self))
+                    pending_tasks = {task for task in tasks_to_wait if not task.done()}
                     remaining = deadline - asyncio.get_running_loop().time()
                     if remaining <= 0:
                         clean = False
-                        ExchangePyBase.logger().warning(
-                            f"Timed out draining {sum(not task.done() for task in owned_tasks_to_wait)} "
-                            "exchange network task(s)."
-                        )
+                        timed_out = True
                         break
-                    _, pending = await asyncio.wait(
-                        {task for task in owned_tasks_to_wait if not task.done()},
+
+                    if not pending_tasks:
+                        if not invalidated and fixed_point_observed:
+                            break
+                        fixed_point_observed = not invalidated
+                        await asyncio.sleep(0)
+                        continue
+
+                    fixed_point_observed = False
+                    done, pending = await asyncio.wait(
+                        pending_tasks,
                         timeout=remaining,
                     )
+                    for task in done:
+                        ExchangePyBase._network_task_done(self, task)
                     if pending:
                         clean = False
-                        ExchangePyBase.logger().warning(
-                            f"Timed out draining {len(pending)} exchange network task(s)."
-                        )
+                        timed_out = True
                         break
                     await asyncio.sleep(0)
+
+                if timed_out:
+                    # A cancellation-resistant task may publish another
+                    # registered generation as the deadline expires. Give
+                    # those cancellation handlers bounded event-loop turns so
+                    # every published handle is cleared, cancelled and kept in
+                    # the drain registry for the next retry.
+                    final_scan_limit = len(ExchangePyBase._NETWORK_TASK_ATTRIBUTES) + 1
+                    fixed_point_observations = 0
+                    for _ in range(final_scan_limit):
+                        invalidated = ExchangePyBase._invalidate_registered_network_tasks(self)
+                        set(ExchangePyBase._network_task_registry(self))
+                        if invalidated:
+                            fixed_point_observations = 0
+                        else:
+                            fixed_point_observations += 1
+                        if fixed_point_observations >= 2:
+                            break
+                        await asyncio.sleep(0)
+                    remaining_tasks = set(ExchangePyBase._network_task_registry(self))
+                    ExchangePyBase.logger().warning(
+                        f"Timed out draining {sum(not task.done() for task in remaining_tasks)} "
+                        "exchange network task(s)."
+                    )
 
                 cleanup_error = None
                 for cleanup_task in cleanup_tasks:

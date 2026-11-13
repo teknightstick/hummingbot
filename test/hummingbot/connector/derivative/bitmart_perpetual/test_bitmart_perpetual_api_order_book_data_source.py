@@ -22,6 +22,7 @@ from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.core.data_type.funding_info import FundingInfo
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
+from hummingbot.core.data_type.order_book_tracker import OrderBookTracker
 
 
 class BitmartPerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
@@ -600,15 +601,61 @@ class BitmartPerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
         )
 
     async def test_unsubscribe_from_trading_pair_websocket_not_connected(self):
-        """Test unsubscription fails when WebSocket is not connected."""
+        """A disconnected WebSocket has no remote subscription left to remove."""
         self.data_source._ws_assistant = None
 
         result = await self.data_source.unsubscribe_from_trading_pair(self.trading_pair)
 
-        self.assertFalse(result)
+        self.assertTrue(result)
+        self.assertNotIn(self.trading_pair, self.data_source._trading_pairs)
         self.assertTrue(
-            self._is_logged("WARNING", f"Cannot unsubscribe from {self.trading_pair}: WebSocket connection not established.")
+            self._is_logged(
+                "INFO",
+                f"WebSocket session is closed; cleared local subscription for {self.trading_pair}",
+            )
         )
+
+    async def test_dynamic_subscription_disconnect_stop_retry_and_restart(self):
+        dynamic_pair = "ETH-USDT"
+        self.connector._set_trading_pair_symbol_map(
+            bidict({self.ex_trading_pair: self.trading_pair, "ETHUSDT": dynamic_pair})
+        )
+        self.data_source.get_new_order_book = AsyncMock(return_value=OrderBook())
+
+        async def listen_until_cancelled():
+            await asyncio.Future()
+
+        self.data_source.listen_for_subscriptions = AsyncMock(side_effect=listen_until_cancelled)
+        tracker = OrderBookTracker(
+            data_source=self.data_source,
+            trading_pairs=[self.trading_pair],
+            domain=self.domain,
+        )
+        tracker._sleep = AsyncMock()
+        tracker.start()
+
+        try:
+            await asyncio.wait_for(tracker.wait_ready(), timeout=0.2)
+            self.data_source._ws_assistant = AsyncMock()
+            self.assertTrue(await tracker.add_trading_pair(dynamic_pair))
+            self.assertIn(dynamic_pair, self.data_source._trading_pairs)
+
+            # The real subscription listener clears this reference before the
+            # tracker schedules dynamic unsubscribe cleanup.
+            self.data_source._ws_assistant = None
+            self.assertTrue(await tracker.stop_and_wait(timeout=0.2))
+            self.assertTrue(await tracker.stop_and_wait(timeout=0.2))
+            self.assertNotIn(dynamic_pair, tracker.residual_subscriptions)
+            self.assertNotIn(dynamic_pair, tracker._trading_pairs)
+            self.assertNotIn(dynamic_pair, self.data_source._trading_pairs)
+
+            tracker.start()
+            await asyncio.wait_for(tracker.wait_ready(), timeout=0.2)
+            self.assertNotIn(dynamic_pair, tracker._trading_pairs)
+        finally:
+            if tracker.residual_subscriptions:
+                self.data_source._ws_assistant = AsyncMock()
+            await tracker.stop_and_wait(timeout=0.2)
 
     async def test_unsubscribe_from_trading_pair_raises_cancel_exception(self):
         """Test that CancelledError is properly raised during unsubscription."""

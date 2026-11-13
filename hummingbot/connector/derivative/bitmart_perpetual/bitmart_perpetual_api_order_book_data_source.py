@@ -338,10 +338,14 @@ class BitmartPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         :return: True if unsubscription was successful, False otherwise.
         """
         if self._ws_assistant is None:
-            self.logger().warning(
-                f"Cannot unsubscribe from {trading_pair}: WebSocket connection not established."
+            # The subscription listener clears the assistant only after the
+            # remote session has ended. Every subscription owned by that
+            # session is therefore already gone; only local ownership remains.
+            self.remove_trading_pair(trading_pair)
+            self.logger().info(
+                f"WebSocket session is closed; cleared local subscription for {trading_pair}"
             )
-            return False
+            return True
 
         try:
             symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
