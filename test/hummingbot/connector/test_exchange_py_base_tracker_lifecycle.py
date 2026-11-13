@@ -45,11 +45,51 @@ class _OmittedStopReturnConnector(_LifecycleHarnessBase):
         self.subclass_cleanup_calls += 1
 
 
+class _QueuedCancellationConnector(_LifecycleHarnessBase):
+    async def start_network(self):
+        await super().start_network()
+        self.publications += 1
+
+    async def stop_network(self):
+        await super().stop_network()
+
+
+class _PendingCancellationConnector(_LifecycleHarnessBase):
+    async def start_network(self):
+        await super().start_network()
+
+    async def stop_network(self):
+        result = await super().stop_network()
+        asyncio.current_task().cancel("caller-message")
+        return False if result is None else result
+
+
+class _NoBaseStartConnector(_LifecycleHarnessBase):
+    async def start_network(self):
+        self.publications += 1
+
+
+class _NoBaseStopConnector(_LifecycleHarnessBase):
+    async def stop_network(self):
+        return None
+
+
+class _FailingStopConnector(_LifecycleHarnessBase):
+    async def stop_network(self):
+        await super().stop_network()
+        raise ValueError("override-cleanup")
+
+
 for _connector_class in (
     _LifecycleHarnessBase,
     _PreSuperLifecycleConnector,
     _PostSuperLifecycleConnector,
     _OmittedStopReturnConnector,
+    _QueuedCancellationConnector,
+    _PendingCancellationConnector,
+    _NoBaseStartConnector,
+    _NoBaseStopConnector,
+    _FailingStopConnector,
 ):
     _connector_class.__abstractmethods__ = frozenset()
 
@@ -112,6 +152,142 @@ class ExchangePyBaseTrackerLifecycleTests(IsolatedAsyncioWrapperTestCase):
         order_book_tracker.stop_and_wait.assert_awaited_once_with()
         self.assertIsNone(result)
         self.assertEqual(set(), connector._network_tasks_to_drain)
+
+    async def test_cancelled_queued_stop_does_not_allocate_or_invalidate_generation(self):
+        first_drain_entered = asyncio.Event()
+        first_drain_release = asyncio.Event()
+        drain_calls = 0
+
+        async def drain():
+            nonlocal drain_calls
+            drain_calls += 1
+            if drain_calls == 1:
+                first_drain_entered.set()
+                await first_drain_release.wait()
+            return True
+
+        tracker = MagicMock()
+        tracker.stop_and_wait = AsyncMock(side_effect=drain)
+        tracker.residual_subscriptions = frozenset()
+        connector = self._subclass_connector(_QueuedCancellationConnector, tracker)
+        older_start = asyncio.create_task(connector.start_network())
+        await asyncio.wait_for(first_drain_entered.wait(), timeout=0.2)
+        queued_stop = asyncio.create_task(connector.stop_network())
+        await asyncio.sleep(0)
+        queued_stop.cancel("queued-stop")
+
+        try:
+            with self.assertRaises(asyncio.CancelledError) as raised:
+                await queued_stop
+            self.assertEqual(("queued-stop",), raised.exception.args)
+            first_drain_release.set()
+            await asyncio.wait_for(older_start, timeout=0.2)
+            self.assertEqual(1, tracker.start.call_count)
+            self.assertEqual(1, connector.publications)
+            self.assertEqual(1, connector._network_lifecycle_generation)
+            self.assertEqual({}, connector._network_lifecycle_transactions)
+        finally:
+            first_drain_release.set()
+            await asyncio.gather(older_start, queued_stop, return_exceptions=True)
+
+    async def test_pending_cancellation_wins_over_unclean_start_error_with_message(self):
+        tracker = MagicMock()
+        tracker.stop_and_wait = AsyncMock(return_value=True)
+        tracker.residual_subscriptions = frozenset()
+        connector = self._subclass_connector(_PendingCancellationConnector, tracker)
+        task = asyncio.create_task(connector.start_network())
+
+        with self.assertRaises(asyncio.CancelledError) as raised:
+            await task
+
+        self.assertEqual(("caller-message",), raised.exception.args)
+        self.assertTrue(task.cancelled())
+        tracker.start.assert_not_called()
+
+    async def test_start_override_omitting_super_fails_closed_and_cleans_base_work(self):
+        tracker = MagicMock()
+        tracker.stop_and_wait = AsyncMock(return_value=True)
+        tracker.residual_subscriptions = frozenset()
+        connector = self._subclass_connector(_NoBaseStartConnector, tracker)
+        pending = asyncio.create_task(asyncio.Event().wait())
+        connector._network_tasks_to_drain = {pending}
+
+        with self.assertRaisesRegex(NetworkLifecycleError, "must call super"):
+            await connector.start_network()
+
+        self.assertTrue(pending.done())
+        self.assertGreaterEqual(tracker.stop.call_count, 1)
+        tracker.start.assert_not_called()
+
+    async def test_stop_override_omitting_super_fails_closed_after_base_cleanup(self):
+        tracker = MagicMock()
+        tracker.stop_and_wait = AsyncMock(return_value=True)
+        tracker.residual_subscriptions = frozenset()
+        connector = self._subclass_connector(_NoBaseStopConnector, tracker)
+
+        with self.assertRaisesRegex(NetworkLifecycleError, "must call super"):
+            await connector.stop_network()
+
+        tracker.stop.assert_called_once_with()
+        tracker.stop_and_wait.assert_awaited_once_with()
+
+    async def test_stop_override_exception_is_stable_lifecycle_error(self):
+        tracker = MagicMock()
+        tracker.stop_and_wait = AsyncMock(return_value=True)
+        tracker.residual_subscriptions = frozenset()
+        connector = self._subclass_connector(_FailingStopConnector, tracker)
+
+        with self.assertRaisesRegex(NetworkLifecycleError, "override cleanup") as raised:
+            await connector.stop_network()
+
+        self.assertIsInstance(raised.exception.__cause__, ValueError)
+        tracker.stop.assert_called_once_with()
+
+    async def test_public_stop_cancels_and_clears_registered_override_tasks(self):
+        tracker = MagicMock()
+        tracker.stop_and_wait = AsyncMock(return_value=True)
+        tracker.residual_subscriptions = frozenset()
+        task_attributes = (
+            "_funding_info_listener_task",
+            "_funding_fee_polling_task",
+            "_rate_limits_polling_task",
+            "_queued_orders_task",
+            "_orders_transactions_check_task",
+            "_trade_ws_maintenance_task",
+            "_trade_ws_listener_task",
+            "_balance_update_task",
+            "_position_update_task",
+            "_balance_refresh_task",
+        )
+        tasks = {attribute: asyncio.create_task(asyncio.Event().wait()) for attribute in task_attributes}
+        connector = self._connector(tracker, **tasks)
+
+        self.assertIsNone(await ExchangePyBase.stop_network(connector))
+
+        for attribute, task in tasks.items():
+            self.assertIsNone(getattr(connector, attribute))
+            self.assertTrue(task.done(), attribute)
+        self.assertEqual(set(), connector._network_tasks_to_drain)
+
+    def test_completed_network_task_is_pruned_when_its_loop_stops_before_callbacks(self):
+        connector = MagicMock()
+        connector._network_tasks_to_drain = set()
+        loop = asyncio.new_event_loop()
+
+        async def finish_and_stop():
+            loop.stop()
+            return 1
+
+        try:
+            task = loop.create_task(finish_and_stop())
+            ExchangePyBase._track_network_task(connector, task)
+            loop.run_forever()
+
+            self.assertTrue(task.done())
+            self.assertEqual(0, len(connector._network_tasks_to_drain))
+            self.assertEqual(1, task.result())
+        finally:
+            loop.close()
 
     async def test_newer_stop_waits_for_entire_pre_super_override(self):
         newer_stop_drain_started = asyncio.Event()
@@ -211,7 +387,7 @@ class ExchangePyBaseTrackerLifecycleTests(IsolatedAsyncioWrapperTestCase):
             release_first_stop.set()
             await older_start
             await newer_stop
-            self.assertEqual(0, tracker.start.call_count)
+            self.assertEqual(1, tracker.start.call_count)
         finally:
             release_first_stop.set()
             await asyncio.gather(older_start, newer_stop, return_exceptions=True)
@@ -243,7 +419,7 @@ class ExchangePyBaseTrackerLifecycleTests(IsolatedAsyncioWrapperTestCase):
             release_first_stop.set()
             await first
             await second
-            self.assertEqual(1, tracker.start.call_count)
+            self.assertEqual(2, tracker.start.call_count)
         finally:
             release_first_stop.set()
             await asyncio.gather(first, second, return_exceptions=True)

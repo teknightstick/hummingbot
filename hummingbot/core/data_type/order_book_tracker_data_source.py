@@ -35,6 +35,28 @@ class _DiscardingQueue:
         return 0
 
 
+class _DiscardingQueueMapping(MutableMapping[str, asyncio.Queue]):
+    """Non-growing mapping sink for writes inherited from retired producers."""
+
+    def __init__(self):
+        self._sink = _DiscardingQueue()
+
+    def __getitem__(self, key: str) -> asyncio.Queue:
+        return self._sink
+
+    def __setitem__(self, key: str, value: asyncio.Queue):
+        return None
+
+    def __delitem__(self, key: str):
+        return None
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+
 class _GenerationBoundMessageQueues(MutableMapping[str, asyncio.Queue]):
     """Mapping view that resolves raw queues from the producer task's session generation."""
 
@@ -82,7 +104,7 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
         self._raw_message_queues: Dict[Optional[int], MutableMapping[str, asyncio.Queue]] = {
             None: defaultdict(asyncio.Queue)
         }
-        self._discarded_raw_message_queues: MutableMapping[str, asyncio.Queue] = defaultdict(_DiscardingQueue)
+        self._discarded_raw_message_queues: MutableMapping[str, asyncio.Queue] = _DiscardingQueueMapping()
         self._message_queue_view = _GenerationBoundMessageQueues(self)
         self._ws_assistant: Optional[WSAssistant] = None
 

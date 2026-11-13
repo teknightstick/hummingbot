@@ -3,6 +3,7 @@ import copy
 import logging
 import math
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from decimal import Decimal
 from functools import wraps
 from typing import Any, AsyncIterable, Callable, Dict, List, Optional, Tuple
@@ -72,6 +73,48 @@ class _NetworkStopState:
         self.clean = True
 
 
+@dataclass
+class _NetworkLifecycleTransaction:
+    generation: int
+    base_start_called: bool = False
+    base_stop_called: bool = False
+
+
+def _retrieve_network_task_exception(task: asyncio.Task):
+    if task.cancelled():
+        return
+    try:
+        exception = task.exception()
+    except asyncio.CancelledError:
+        return
+    if exception is not None:
+        logging.getLogger(__name__).error(
+            "Error while draining an exchange network lifecycle task.",
+            exc_info=(type(exception), exception, exception.__traceback__),
+        )
+
+
+class _NetworkTaskRegistry(set):
+    """Task set that eagerly consumes and prunes completed work on inspection."""
+
+    def _prune_done(self):
+        for task in set.copy(self):
+            if task.done():
+                set.discard(self, task)
+                _retrieve_network_task_exception(task)
+
+    def __iter__(self):
+        self._prune_done()
+        return set.__iter__(self)
+
+    def __len__(self):
+        self._prune_done()
+        return set.__len__(self)
+
+    def __bool__(self):
+        return len(self) > 0
+
+
 class ExchangePyBase(ExchangeBase, ABC):
     _logger = None
 
@@ -80,6 +123,25 @@ class ExchangePyBase(ExchangeBase, ABC):
     TRADING_RULES_INTERVAL = 30 * MINUTE
     TRADING_FEES_INTERVAL = TWELVE_HOURS
     TICK_INTERVAL_LIMIT = 60.0
+
+    _NETWORK_TASK_ATTRIBUTES = (
+        "_status_polling_task",
+        "_trading_rules_polling_task",
+        "_trading_fees_polling_task",
+        "_user_stream_tracker_task",
+        "_user_stream_event_listener_task",
+        "_lost_orders_update_task",
+        "_funding_info_listener_task",
+        "_funding_fee_polling_task",
+        "_rate_limits_polling_task",
+        "_queued_orders_task",
+        "_orders_transactions_check_task",
+        "_trade_ws_maintenance_task",
+        "_trade_ws_listener_task",
+        "_balance_update_task",
+        "_position_update_task",
+        "_balance_refresh_task",
+    )
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -118,8 +180,8 @@ class ExchangePyBase(ExchangeBase, ABC):
         self._trading_fees_polling_task: Optional[asyncio.Task] = None
         self._lost_orders_update_task: Optional[asyncio.Task] = None
         self._network_lifecycle_generation: int = 0
-        self._network_lifecycle_transactions: Dict[asyncio.Task, int] = {}
-        self._network_tasks_to_drain: set[asyncio.Task] = set()
+        self._network_lifecycle_transactions: Dict[asyncio.Task, _NetworkLifecycleTransaction] = {}
+        self._network_tasks_to_drain: set[asyncio.Task] = _NetworkTaskRegistry()
         self._network_lifecycle_lock = _ReentrantNetworkLifecycleLock()
         self._network_stop_states: Dict[asyncio.Task, _NetworkStopState] = {}
 
@@ -767,21 +829,24 @@ class ExchangePyBase(ExchangeBase, ABC):
 
     @staticmethod
     async def _run_serialized_lifecycle_override(connector, method_name, method, *args, **kwargs):
-        _, owns_transaction = ExchangePyBase._enter_network_lifecycle(connector)
         lifecycle_lock = ExchangePyBase._network_lifecycle_lock_for(connector)
-        try:
-            async with lifecycle_lock:
+        async with lifecycle_lock:
+            transaction, owns_transaction = ExchangePyBase._enter_network_lifecycle(connector)
+            try:
                 stop_state = None
                 stop_task = None
                 if method_name == "stop_network":
                     stop_state, stop_task = ExchangePyBase._network_stop_state_for(connector)
+                    ExchangePyBase._invalidate_registered_network_tasks(connector)
                 try:
                     try:
                         result = await method(connector, *args, **kwargs)
                     except asyncio.CancelledError:
-                        if method_name == "start_network":
+                        if method_name == "start_network" and (
+                            transaction.base_start_called or not transaction.base_stop_called
+                        ):
                             try:
-                                await connector.stop_network()
+                                await ExchangePyBase.stop_network(connector)
                             except asyncio.CancelledError:
                                 pass
                             except Exception:
@@ -789,7 +854,38 @@ class ExchangePyBase(ExchangeBase, ABC):
                                     "Error cleaning up a cancelled exchange network start."
                                 )
                         raise
+                    except Exception as exception:
+                        if method_name != "stop_network":
+                            raise
+                        stop_state.clean = False
+                        if not transaction.base_stop_called:
+                            try:
+                                await ExchangePyBase.stop_network(connector)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                ExchangePyBase.logger().exception(
+                                    "Error running base cleanup after a stop override failure."
+                                )
+                        await asyncio.sleep(0)
+                        raise NetworkLifecycleError(
+                            "Exchange stop_network override cleanup failed."
+                        ) from exception
+                    if method_name == "start_network" and not transaction.base_start_called:
+                        ExchangePyBase._cancel_network_drain_tasks(connector)
+                        await ExchangePyBase.stop_network(connector)
+                        await asyncio.sleep(0)
+                        raise NetworkLifecycleError(
+                            "Exchange start_network override must call super().start_network()."
+                        )
                     if method_name == "stop_network":
+                        if not transaction.base_stop_called:
+                            ExchangePyBase._cancel_network_drain_tasks(connector)
+                            await ExchangePyBase.stop_network(connector)
+                            await asyncio.sleep(0)
+                            raise NetworkLifecycleError(
+                                "Exchange stop_network override must call super().stop_network()."
+                            )
                         if result is False:
                             stop_state.clean = False
                         return None if stop_state.clean else False
@@ -799,11 +895,11 @@ class ExchangePyBase(ExchangeBase, ABC):
                         stop_state.depth -= 1
                         if stop_state.depth == 0:
                             getattr(connector, "_network_stop_states", {}).pop(stop_task, None)
-        finally:
-            ExchangePyBase._exit_network_lifecycle(connector, owns_transaction)
+            finally:
+                ExchangePyBase._exit_network_lifecycle(connector, owns_transaction)
 
     @staticmethod
-    def _enter_network_lifecycle(connector) -> Tuple[int, bool]:
+    def _enter_network_lifecycle(connector) -> Tuple[_NetworkLifecycleTransaction, bool]:
         task = asyncio.current_task()
         transactions = getattr(connector, "_network_lifecycle_transactions", None)
         if transactions is None:
@@ -813,8 +909,9 @@ class ExchangePyBase(ExchangeBase, ABC):
             return transactions[task], False
         generation = getattr(connector, "_network_lifecycle_generation", 0) + 1
         connector._network_lifecycle_generation = generation
-        transactions[task] = generation
-        return generation, True
+        transaction = _NetworkLifecycleTransaction(generation=generation)
+        transactions[task] = transaction
+        return transaction, True
 
     @staticmethod
     def _exit_network_lifecycle(connector, owns_transaction: bool):
@@ -827,17 +924,39 @@ class ExchangePyBase(ExchangeBase, ABC):
         return generation == getattr(connector, "_network_lifecycle_generation", 0)
 
     @staticmethod
-    def _network_caller_is_cancelling() -> bool:
-        task = asyncio.current_task()
-        return task is not None and task.cancelling() > 0
+    def _network_task_registry(connector) -> _NetworkTaskRegistry:
+        tasks = getattr(connector, "_network_tasks_to_drain", None)
+        if isinstance(tasks, _NetworkTaskRegistry):
+            return tasks
+        registry = _NetworkTaskRegistry(tasks or ())
+        connector._network_tasks_to_drain = registry
+        return registry
+
+    @staticmethod
+    def _invalidate_registered_network_tasks(connector) -> set[asyncio.Task]:
+        invalidated = set()
+        for attribute in ExchangePyBase._NETWORK_TASK_ATTRIBUTES:
+            task = getattr(connector, attribute, None)
+            if isinstance(task, asyncio.Future):
+                task.cancel()
+                ExchangePyBase._track_network_task(connector, task)
+                invalidated.add(task)
+            if task is not None or hasattr(connector, attribute):
+                setattr(connector, attribute, None)
+        return invalidated
+
+    @staticmethod
+    def _cancel_network_drain_tasks(connector):
+        for task in tuple(ExchangePyBase._network_task_registry(connector)):
+            if not task.done():
+                task.cancel()
 
     @staticmethod
     def _track_network_task(connector, task: asyncio.Task):
-        tasks = getattr(connector, "_network_tasks_to_drain", None)
-        if tasks is None:
-            tasks = set()
-            connector._network_tasks_to_drain = tasks
-        if not task.done() and task not in tasks:
+        tasks = ExchangePyBase._network_task_registry(connector)
+        if task.done():
+            _retrieve_network_task_exception(task)
+        elif task not in tasks:
             tasks.add(task)
             task.add_done_callback(
                 lambda completed: ExchangePyBase._network_task_done(connector, completed)
@@ -845,18 +964,8 @@ class ExchangePyBase(ExchangeBase, ABC):
 
     @staticmethod
     def _network_task_done(connector, task: asyncio.Task):
-        getattr(connector, "_network_tasks_to_drain", set()).discard(task)
-        if task.cancelled():
-            return
-        try:
-            exception = task.exception()
-        except asyncio.CancelledError:
-            return
-        if exception is not None:
-            ExchangePyBase.logger().error(
-                "Error while draining an exchange network lifecycle task.",
-                exc_info=(type(exception), exception, exception.__traceback__),
-            )
+        ExchangePyBase._network_task_registry(connector).discard(task)
+        _retrieve_network_task_exception(task)
 
     async def start_network(self):
         """
@@ -866,18 +975,19 @@ class ExchangePyBase(ExchangeBase, ABC):
         - The polling loop to update order status and balance status using REST API (backup for main update process)
         - The background task to process the events received through the user stream tracker (websocket connection)
         """
-        generation, owns_transaction = ExchangePyBase._enter_network_lifecycle(self)
         lifecycle_lock = ExchangePyBase._network_lifecycle_lock_for(self)
-        try:
-            async with lifecycle_lock:
+        async with lifecycle_lock:
+            transaction, owns_transaction = ExchangePyBase._enter_network_lifecycle(self)
+            transaction.base_start_called = True
+            generation = transaction.generation
+            try:
                 stop_result = await self.stop_network()
                 if stop_result is False:
+                    await asyncio.sleep(0)
                     raise NetworkLifecycleError(
                         "Exchange network start aborted after an unclean stop; "
                         "await a clean stop_network() before retrying."
                     )
-                if ExchangePyBase._network_caller_is_cancelling():
-                    raise asyncio.CancelledError
                 if not ExchangePyBase._network_lifecycle_is_current(self, generation):
                     return
                 self.order_book_tracker.start()
@@ -892,8 +1002,8 @@ class ExchangePyBase(ExchangeBase, ABC):
                     self._lost_orders_update_task = asyncio.ensure_future(
                         self._lost_orders_update_polling_loop()
                     )
-        finally:
-            ExchangePyBase._exit_network_lifecycle(self, owns_transaction)
+            finally:
+                ExchangePyBase._exit_network_lifecycle(self, owns_transaction)
 
     async def check_network(self) -> NetworkStatus:
         """
@@ -908,12 +1018,13 @@ class ExchangePyBase(ExchangeBase, ABC):
         return NetworkStatus.CONNECTED
 
     async def stop_network(self):
-        _, owns_transaction = ExchangePyBase._enter_network_lifecycle(self)
         lifecycle_lock = ExchangePyBase._network_lifecycle_lock_for(self)
-        try:
-            async with lifecycle_lock:
+        async with lifecycle_lock:
+            transaction, owns_transaction = ExchangePyBase._enter_network_lifecycle(self)
+            transaction.base_stop_called = True
+            try:
                 cleanup_tasks = []
-                owned_tasks_to_wait = set(getattr(self, "_network_tasks_to_drain", set()))
+                owned_tasks_to_wait = set(ExchangePyBase._network_task_registry(self))
                 clean = True
                 # Invalidate every task index synchronously before the first await.
                 self._last_poll_timestamp = 0
@@ -921,22 +1032,7 @@ class ExchangePyBase(ExchangeBase, ABC):
                 self._poll_notifier = asyncio.Event()
                 self.order_book_tracker.stop()
 
-                task_attributes = (
-                    "_status_polling_task",
-                    "_trading_rules_polling_task",
-                    "_trading_fees_polling_task",
-                    "_user_stream_tracker_task",
-                    "_user_stream_event_listener_task",
-                    "_lost_orders_update_task",
-                )
-                for attribute in task_attributes:
-                    task = getattr(self, attribute, None)
-                    if task is not None:
-                        task.cancel()
-                        if isinstance(task, asyncio.Future):
-                            ExchangePyBase._track_network_task(self, task)
-                            owned_tasks_to_wait.add(task)
-                    setattr(self, attribute, None)
+                owned_tasks_to_wait.update(ExchangePyBase._invalidate_registered_network_tasks(self))
 
                 tracker_drain_task = asyncio.ensure_future(self.order_book_tracker.stop_and_wait())
                 cleanup_tasks.append(tracker_drain_task)
@@ -998,12 +1094,13 @@ class ExchangePyBase(ExchangeBase, ABC):
 
                 ExchangePyBase._record_network_stop_result(self, clean)
                 if cleanup_error is not None:
+                    await asyncio.sleep(0)
                     raise NetworkLifecycleError(
                         "Exchange network cleanup task failed during stop."
                     ) from cleanup_error
                 return None if clean else False
-        finally:
-            ExchangePyBase._exit_network_lifecycle(self, owns_transaction)
+            finally:
+                ExchangePyBase._exit_network_lifecycle(self, owns_transaction)
 
     async def add_trading_pair(self, trading_pair: str) -> bool:
         """

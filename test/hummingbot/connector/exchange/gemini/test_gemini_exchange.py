@@ -1435,7 +1435,13 @@ class GeminiExchangeTests(TestCase):
         self.exchange._trade_ws_stopped = True
         self.exchange._trade_ws_last_connect_failure = 12345.0
 
-        with patch.object(ExchangePyBase, "start_network", new_callable=AsyncMock):
+        async def mark_base_start_called():
+            transaction = self.exchange._network_lifecycle_transactions[asyncio.current_task()]
+            transaction.base_start_called = True
+
+        with patch.object(
+            ExchangePyBase, "start_network", new_callable=AsyncMock, side_effect=mark_base_start_called
+        ):
             self._async_run(self.exchange.start_network())
 
         self.assertFalse(self.exchange._trade_ws_stopped)
@@ -1470,8 +1476,25 @@ class GeminiExchangeTests(TestCase):
             side_effect=Exception("offline"))
 
         async def scenario():
-            with patch.object(ExchangePyBase, "start_network", new_callable=AsyncMock), \
-                    patch.object(ExchangePyBase, "stop_network", new_callable=AsyncMock):
+            async def mark_base_start_called():
+                transaction = trading_exchange._network_lifecycle_transactions[asyncio.current_task()]
+                transaction.base_start_called = True
+
+            async def mark_base_stop_called():
+                transaction = trading_exchange._network_lifecycle_transactions[asyncio.current_task()]
+                transaction.base_stop_called = True
+
+            with patch.object(
+                ExchangePyBase,
+                "start_network",
+                new_callable=AsyncMock,
+                side_effect=mark_base_start_called,
+            ), patch.object(
+                ExchangePyBase,
+                "stop_network",
+                new_callable=AsyncMock,
+                side_effect=mark_base_stop_called,
+            ):
                 await trading_exchange.start_network()
                 spawned_task = trading_exchange._trade_ws_maintenance_task
                 await asyncio.sleep(0.05)  # let the loop attempt (and fail) a connect
