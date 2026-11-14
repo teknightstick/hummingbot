@@ -529,8 +529,11 @@ class CandlesBase(NetworkBase):
                 if len(self._candles) == 0:
                     self._candles.append(candles_row)
                     self._ws_candle_available.set()
-                    fill_candles_task = safe_ensure_future(self.fill_historical_candles())
-                    self._bind_fill_candles_task(websocket_assistant, fill_candles_task)
+                    fill_candles_task = self._fill_candles_task_owner.create_task(
+                        websocket_assistant,
+                        lambda: safe_ensure_future(self.fill_historical_candles()),
+                    )
+                    self._fill_candles_task = fill_candles_task
                 else:
                     latest_timestamp = int(self._candles[-1][0])
                     current_timestamp = int(parsed_message["timestamp"])
@@ -589,10 +592,7 @@ class CandlesBase(NetworkBase):
                 cleanup_error_message="Error while cleaning up the fill candles task owner",
             )
         finally:
-            owns_current_state = (
-                self._fill_candles_task_owner.is_current_generation(websocket_assistant)
-                and (fill_candles_task is None or self._fill_candles_task is fill_candles_task)
-            )
+            owns_current_state = self._fill_candles_task_owner.is_current_generation(websocket_assistant)
             if owns_current_state:
                 self._ws_candle_available.clear()
                 self._candles.clear()

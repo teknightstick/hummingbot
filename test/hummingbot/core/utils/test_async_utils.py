@@ -6,7 +6,7 @@ import weakref
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import MagicMock
 
-from hummingbot.core.utils.async_utils import GenerationOwnedTaskOwner
+from hummingbot.core.utils.async_utils import GenerationOwnedTaskOwner, await_primary_then_cleanup
 
 
 class _Generation:
@@ -154,3 +154,58 @@ class GenerationOwnedTaskOwnerTests(IsolatedAsyncioWrapperTestCase):
         await asyncio.sleep(0)
         self.assertEqual(1, callback_counts[replacement_task_id])
         owner.end_generation(replacement_generation)
+
+    async def test_throwing_completion_callback_is_isolated_and_child_failure_is_finalized_once(self):
+        callback_count = 0
+
+        def on_task_done(done_task):
+            nonlocal callback_count
+            callback_count += 1
+            raise RuntimeError("completion callback failed")
+
+        async def fail():
+            raise ValueError("child failed")
+
+        logger = MagicMock()
+        owner = self._owner(logger, on_task_done)
+        generation = _Generation()
+        task = _ExceptionCountingTask(fail(), loop=asyncio.get_running_loop())
+        owner.bind_task(generation, task)
+        owner.end_generation(generation)
+
+        loop = asyncio.get_running_loop()
+        loop_callback_failures = []
+        previous_exception_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _, context: loop_callback_failures.append(context))
+        primary_error = LookupError("sentinel")
+
+        async def primary():
+            raise primary_error
+
+        try:
+            await asyncio.wait({task})
+            await asyncio.sleep(0)
+            with self.assertRaises(LookupError) as primary_context:
+                await await_primary_then_cleanup(
+                    primary=primary(),
+                    cleanup=lambda: owner.cleanup(task, timeout=0.01),
+                    logger=logger,
+                    cleanup_error_message="owner cleanup failed",
+                )
+            await asyncio.gather(*(owner.cleanup(task, timeout=0.01) for _ in range(32)))
+            await owner.cleanup(task, timeout=0.01)
+        finally:
+            loop.set_exception_handler(previous_exception_handler)
+
+        self.assertIs(primary_error, primary_context.exception)
+        self.assertEqual(1, callback_count)
+        self.assertEqual(1, task.exception_calls)
+        self.assertEqual([], loop_callback_failures)
+        self.assertEqual(2, logger.error.call_count)
+        logged_messages = [call.args[0] for call in logger.error.call_args_list]
+        self.assertIn("cleanup failed", logged_messages)
+        self.assertIn("Generation-owned task completion callback failed", logged_messages)
+        self.assertIsNone(owner._current_generation)
+        self.assertIsNone(owner._current_task)
+        self.assertEqual({}, owner._tasks_by_generation)
+        self.assertEqual(set(), owner._residual_tasks)

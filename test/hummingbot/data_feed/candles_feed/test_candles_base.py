@@ -35,6 +35,9 @@ class _InterruptionTestCandles(CandlesBase):
     def get_exchange_trading_pair(self, trading_pair):
         return trading_pair
 
+    def _parse_websocket_message(self, data):
+        return data
+
 
 class TestCandlesBaseInterruption(IsolatedAsyncioWrapperTestCase):
     level = 0
@@ -151,6 +154,97 @@ class TestCandlesBaseInterruption(IsolatedAsyncioWrapperTestCase):
             old_fill_release.set()
             old_disconnect_release.set()
             await asyncio.gather(old_task, return_exceptions=True)
+
+    async def test_fill_finishing_during_blocked_disconnect_clears_owned_candle_state(self):
+        websocket_assistant = AsyncMock()
+        disconnect_started = asyncio.Event()
+        disconnect_release = asyncio.Event()
+        fill_release = asyncio.Event()
+
+        async def disconnect():
+            disconnect_started.set()
+            await disconnect_release.wait()
+
+        async def fill():
+            await fill_release.wait()
+
+        websocket_assistant.disconnect.side_effect = disconnect
+        fill_task = asyncio.create_task(fill())
+        self._bind_fill_task(websocket_assistant, fill_task)
+        candle = [230.0] * len(self.data_feed.columns)
+        self.data_feed._candles.append(candle)
+        self.data_feed._ws_candle_available.set()
+
+        interruption_task = asyncio.create_task(
+            self.data_feed._on_order_stream_interruption(websocket_assistant)
+        )
+        await disconnect_started.wait()
+
+        fill_release.set()
+        await fill_task
+        await asyncio.sleep(0)
+        self.assertIsNone(self.data_feed._fill_candles_task)
+        self.assertTrue(self.data_feed._fill_candles_task_owner.is_current_generation(websocket_assistant))
+
+        disconnect_release.set()
+        await interruption_task
+
+        self.assertFalse(self.data_feed._ws_candle_available.is_set())
+        self.assertEqual([], list(self.data_feed._candles))
+        self.assertFalse(self.data_feed._fill_candles_task_owner.is_current_generation(websocket_assistant))
+
+    async def test_reset_with_live_fill_rejects_before_scheduling_an_orphan(self):
+        websocket_assistant = AsyncMock()
+        predecessor_release = asyncio.Event()
+        orphan_release = asyncio.Event()
+        predecessor = asyncio.create_task(predecessor_release.wait())
+        created_tasks = []
+        orphan_mutations = []
+
+        async def orphan_fill():
+            orphan_mutations.append("started")
+            await orphan_release.wait()
+
+        def schedule(coroutine):
+            task = asyncio.create_task(coroutine)
+            created_tasks.append(task)
+            return task
+
+        async def iter_messages():
+            yield MagicMock(data={
+                "timestamp": 230,
+                "open": 1,
+                "high": 2,
+                "low": 0,
+                "close": 1,
+                "volume": 3,
+                "quote_asset_volume": 4,
+                "n_trades": 5,
+                "taker_buy_base_volume": 6,
+                "taker_buy_quote_volume": 7,
+            })
+
+        websocket_assistant.iter_messages = iter_messages
+        self._bind_fill_task(websocket_assistant, predecessor)
+        self.data_feed._reset_candles()
+
+        try:
+            with patch.object(self.data_feed, "fill_historical_candles", side_effect=orphan_fill), patch(
+                "hummingbot.data_feed.candles_feed.candles_base.safe_ensure_future",
+                side_effect=schedule,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "generation already owns a live task"):
+                    await self.data_feed._process_websocket_messages_task(websocket_assistant)
+                await asyncio.sleep(0)
+
+            self.assertEqual([], created_tasks)
+            self.assertEqual([], orphan_mutations)
+            self.assertIs(predecessor, self.data_feed._fill_candles_task)
+            self.assertIs(predecessor, self.data_feed._fill_candles_task_owner.task_for(websocket_assistant))
+        finally:
+            predecessor_release.set()
+            orphan_release.set()
+            await asyncio.gather(predecessor, *created_tasks, return_exceptions=True)
 
     async def test_residual_fill_gates_listener_reconnect_until_release(self):
         old_websocket = AsyncMock()
@@ -290,7 +384,7 @@ class TestCandlesBaseInterruption(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(fill_task.cancelled())
         self.assertIsNone(self.data_feed._fill_candles_task)
 
-    async def test_blocked_disconnect_snapshots_fill_task_and_leaves_replacement_untouched(self):
+    async def test_blocked_disconnect_uses_generation_ownership_after_task_alias_changes(self):
         old_started = asyncio.Event()
         old_finalized = []
         old_cancellations = []
@@ -335,8 +429,8 @@ class TestCandlesBaseInterruption(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(old_task.cancelled())
         self.assertIs(replacement_task, self.data_feed._fill_candles_task)
         self.assertFalse(replacement_task.done())
-        self.assertTrue(self.data_feed._ws_candle_available.is_set())
-        self.assertEqual([replacement_candle], list(self.data_feed._candles))
+        self.assertFalse(self.data_feed._ws_candle_available.is_set())
+        self.assertEqual([], list(self.data_feed._candles))
         replacement_task.cancel()
         await asyncio.gather(replacement_task, return_exceptions=True)
 

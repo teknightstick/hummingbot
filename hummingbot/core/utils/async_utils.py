@@ -58,6 +58,19 @@ class GenerationOwnedTaskOwner:
             return
         if existing is not None and not existing.done():
             raise RuntimeError("The generation already owns a live task")
+        self._bind_task(generation, task)
+
+    def create_task(self, generation: object, task_factory: Callable[[], asyncio.Task]) -> asyncio.Task:
+        """Validate ownership before synchronously creating and binding a task."""
+        self.begin_generation(generation)
+        existing = self.task_for(generation)
+        if existing is not None and not existing.done():
+            raise RuntimeError("The generation already owns a live task")
+        task = task_factory()
+        self._bind_task(generation, task)
+        return task
+
+    def _bind_task(self, generation: object, task: asyncio.Task):
         self._tasks_by_generation[id(generation)] = (generation, task)
         self._current_generation = generation
         self._current_task = task
@@ -159,7 +172,13 @@ class GenerationOwnedTaskOwner:
                 self._end_requested_generation_ids.discard(generation_id)
                 if self._current_generation is generation and self.task_for(generation) is None:
                     self._current_generation = None
-        self._on_task_done(task)
+        try:
+            self._on_task_done(task)
+        except BaseException as callback_error:
+            self._logger.error(
+                "Generation-owned task completion callback failed",
+                exc_info=(type(callback_error), callback_error, callback_error.__traceback__),
+            )
 
         if task.cancelled():
             return
