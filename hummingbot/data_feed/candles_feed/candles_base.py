@@ -66,7 +66,6 @@ class CandlesBase(NetworkBase):
             ),
             on_task_done=self._release_fill_candles_task,
         )
-        self._residual_fill_candles_tasks = self._fill_candles_task_owner.residual_tasks
         self._trading_pair = trading_pair
         # Optional reference to the backing connector (same exchange). When present, the feed reuses
         # the connector's public symbol map and cached exchange-data instead of fetching them itself.
@@ -454,8 +453,8 @@ class CandlesBase(NetworkBase):
         Connects to the candlestick websocket endpoint and listens to the messages sent by the
         exchange.
         """
-        ws: Optional[WSAssistant] = None
         while True:
+            ws: Optional[WSAssistant] = None
             try:
                 await self._fill_candles_task_owner.wait_until_released()
                 ws: WSAssistant = await self._connected_websocket_assistant()
@@ -476,7 +475,17 @@ class CandlesBase(NetworkBase):
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        await ws.connect(ws_url=self.wss_url, ping_timeout=self._ping_timeout)
+        try:
+            await ws.connect(ws_url=self.wss_url, ping_timeout=self._ping_timeout)
+        except BaseException:
+            try:
+                await ws.disconnect()
+            except BaseException as cleanup_error:
+                self.logger().error(
+                    "Error while cleaning up a WebSocket assistant after connection failure",
+                    exc_info=(type(cleanup_error), cleanup_error, cleanup_error.__traceback__),
+                )
+            raise
         return ws
 
     @property
@@ -529,11 +538,10 @@ class CandlesBase(NetworkBase):
                 if len(self._candles) == 0:
                     self._candles.append(candles_row)
                     self._ws_candle_available.set()
-                    fill_candles_task = self._fill_candles_task_owner.create_task(
+                    self._create_fill_candles_task(
                         websocket_assistant,
                         lambda: safe_ensure_future(self.fill_historical_candles()),
                     )
-                    self._fill_candles_task = fill_candles_task
                 else:
                     latest_timestamp = int(self._candles[-1][0])
                     current_timestamp = int(parsed_message["timestamp"])
@@ -600,10 +608,17 @@ class CandlesBase(NetworkBase):
 
     def _start_candle_generation(self, websocket_assistant: WSAssistant):
         self._fill_candles_task_owner.begin_generation(websocket_assistant)
+        self._candles.clear()
+        self._ws_candle_available.clear()
 
-    def _bind_fill_candles_task(self, websocket_assistant: WSAssistant, fill_candles_task: asyncio.Task):
-        self._fill_candles_task_owner.bind_task(websocket_assistant, fill_candles_task)
+    def _create_fill_candles_task(self, websocket_assistant: WSAssistant, task_factory) -> asyncio.Task:
+        fill_candles_task = self._fill_candles_task_owner.create_task(websocket_assistant, task_factory)
         self._fill_candles_task = fill_candles_task
+        return fill_candles_task
+
+    @property
+    def _residual_fill_candles_tasks(self):
+        return self._fill_candles_task_owner.residual_tasks
 
     def _release_fill_candles_task(self, fill_candles_task: asyncio.Task):
         if self._fill_candles_task is fill_candles_task:

@@ -23,6 +23,11 @@ class _ExceptionCountingTask(asyncio.Task):
         return super().exception()
 
 
+class _CallbackRegistrationFailingTask(asyncio.Task):
+    def add_done_callback(self, callback, *args, **kwargs):
+        raise RuntimeError("callback registration failed")
+
+
 class GenerationOwnedTaskOwnerTests(IsolatedAsyncioWrapperTestCase):
     @staticmethod
     async def _cancellation_suppressing_task(started, cancellation_seen, release):
@@ -41,6 +46,124 @@ class GenerationOwnedTaskOwnerTests(IsolatedAsyncioWrapperTestCase):
             residual_warning_message="residual retained",
             on_task_done=callback,
         )
+
+    async def test_create_task_rolls_back_when_factory_raises(self):
+        owner = self._owner(MagicMock(), MagicMock())
+        generation = _Generation()
+        factory_error = RuntimeError("factory failed")
+
+        with self.assertRaises(RuntimeError) as context:
+            owner.create_task(generation, MagicMock(side_effect=factory_error))
+
+        self.assertIs(factory_error, context.exception)
+        self.assertIsNone(owner._current_generation)
+        self.assertIsNone(owner._current_task)
+        self.assertEqual({}, owner._tasks_by_generation)
+
+    async def test_create_task_rejects_invalid_return_without_publishing(self):
+        owner = self._owner(MagicMock(), MagicMock())
+        generation = _Generation()
+
+        with self.assertRaisesRegex(TypeError, "asyncio.Task"):
+            owner.create_task(generation, object)
+
+        self.assertIsNone(owner._current_generation)
+        self.assertIsNone(owner._current_task)
+        self.assertEqual({}, owner._tasks_by_generation)
+
+    async def test_create_task_rolls_back_and_cancels_when_callback_registration_fails(self):
+        owner = self._owner(MagicMock(), MagicMock())
+        generation = _Generation()
+        task = _CallbackRegistrationFailingTask(
+            asyncio.sleep(10),
+            loop=asyncio.get_running_loop(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "callback registration failed"):
+            owner.create_task(generation, lambda: task)
+        await asyncio.sleep(0)
+
+        self.assertTrue(task.cancelled())
+        self.assertIsNone(owner._current_generation)
+        self.assertIsNone(owner._current_task)
+        self.assertEqual({}, owner._tasks_by_generation)
+
+    async def test_create_task_rejects_reentrant_factory_without_inner_or_outer_orphan(self):
+        owner = self._owner(MagicMock(), MagicMock())
+        generation = _Generation()
+        created_tasks = []
+
+        def inner_factory():
+            task = asyncio.create_task(asyncio.sleep(10))
+            created_tasks.append(task)
+            return task
+
+        def outer_factory():
+            try:
+                owner.create_task(generation, inner_factory)
+            except RuntimeError:
+                pass
+            task = asyncio.create_task(asyncio.sleep(10))
+            created_tasks.append(task)
+            return task
+
+        try:
+            with self.assertRaisesRegex(RuntimeError, "Reentrant task creation"):
+                owner.create_task(generation, outer_factory)
+            await asyncio.sleep(0)
+
+            self.assertEqual(1, len(created_tasks))
+            self.assertTrue(created_tasks[0].cancelled())
+            self.assertIsNone(owner._current_generation)
+            self.assertIsNone(owner._current_task)
+            self.assertEqual({}, owner._tasks_by_generation)
+        finally:
+            for task in created_tasks:
+                task.cancel()
+            await asyncio.gather(*created_tasks, return_exceptions=True)
+
+    async def test_create_task_invokes_one_factory_for_repeated_callers(self):
+        owner = self._owner(MagicMock(), MagicMock())
+        generation = _Generation()
+        factory_calls = 0
+
+        def factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            return asyncio.create_task(asyncio.sleep(10))
+
+        task = owner.create_task(generation, factory)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "generation already owns a live task"):
+                owner.create_task(generation, factory)
+
+            self.assertEqual(1, factory_calls)
+            self.assertIs(task, owner.current_task)
+            self.assertIs(task, owner.task_for(generation))
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            owner.end_generation(generation)
+
+    async def test_wait_until_released_waits_for_open_generation_without_live_task(self):
+        owner = self._owner(MagicMock(), MagicMock())
+        generation = _Generation()
+        owner.begin_generation(generation)
+        waiter = asyncio.create_task(owner.wait_until_released())
+
+        await asyncio.sleep(0)
+        self.assertFalse(waiter.done())
+
+        owner.end_generation(generation)
+        await asyncio.wait_for(waiter, timeout=0.1)
+
+    def test_residual_tasks_is_an_immutable_snapshot(self):
+        owner = self._owner(MagicMock(), MagicMock())
+
+        snapshot = owner.residual_tasks
+
+        self.assertIsInstance(snapshot, frozenset)
+        self.assertIsNot(snapshot, owner._residual_tasks)
 
     async def test_ended_residual_finalizes_once_and_releases_generation_and_task(self):
         callback_counts = {}

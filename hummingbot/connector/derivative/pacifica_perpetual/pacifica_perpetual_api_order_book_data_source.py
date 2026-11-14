@@ -49,7 +49,6 @@ class PacificaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             ),
             on_task_done=self._release_ping_task,
         )
-        self._residual_ping_tasks = self._ping_task_owner.residual_tasks
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
@@ -191,15 +190,28 @@ class PacificaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         async with self._ping_connection_lock:
             await self._ping_task_owner.wait_until_released()
             ws: WSAssistant = await self._api_factory.get_ws_assistant()
-
-            await ws.connect(ws_url=web_utils.wss_url(self._domain), ws_headers=self._get_headers())
-            ping_task = safe_ensure_future(self._ping_loop(ws))
-            self._bind_ping_task(ws, ping_task)
+            try:
+                await ws.connect(ws_url=web_utils.wss_url(self._domain), ws_headers=self._get_headers())
+            except BaseException:
+                try:
+                    await ws.disconnect()
+                except BaseException as cleanup_error:
+                    self.logger().error(
+                        "Error while cleaning up a Pacifica WebSocket assistant after connection failure",
+                        exc_info=(type(cleanup_error), cleanup_error, cleanup_error.__traceback__),
+                    )
+                raise
+            self._create_ping_task(ws, lambda: safe_ensure_future(self._ping_loop(ws)))
             return ws
 
-    def _bind_ping_task(self, websocket_assistant: WSAssistant, ping_task: asyncio.Task):
-        self._ping_task_owner.bind_task(websocket_assistant, ping_task)
+    def _create_ping_task(self, websocket_assistant: WSAssistant, task_factory) -> asyncio.Task:
+        ping_task = self._ping_task_owner.create_task(websocket_assistant, task_factory)
         self._ping_task = ping_task
+        return ping_task
+
+    @property
+    def _residual_ping_tasks(self):
+        return self._ping_task_owner.residual_tasks
 
     def _release_ping_task(self, ping_task: asyncio.Task):
         if self._ping_task is ping_task:

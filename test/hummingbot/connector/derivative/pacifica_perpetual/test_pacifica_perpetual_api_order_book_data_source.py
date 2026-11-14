@@ -123,7 +123,7 @@ class PacificaPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCas
                 cancellation_seen.set()
 
     def _bind_ping_task(self, websocket_assistant, ping_task):
-        self.data_source._bind_ping_task(websocket_assistant, ping_task)
+        self.data_source._create_ping_task(websocket_assistant, lambda: ping_task)
 
     async def test_residual_ping_gates_reconnect_and_repeated_cleanup_is_bounded(self):
         old_websocket = AsyncMock()
@@ -191,35 +191,24 @@ class PacificaPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCas
 
     async def test_stale_hook_entering_after_replacement_does_not_touch_replacement_ping(self):
         old_websocket = AsyncMock()
-        old_disconnect_started = asyncio.Event()
-        old_disconnect_release = asyncio.Event()
         old_ping_release = asyncio.Event()
-
-        async def disconnect_old():
-            old_disconnect_started.set()
-            await old_disconnect_release.wait()
 
         async def old_ping():
             await old_ping_release.wait()
 
-        old_websocket.disconnect.side_effect = disconnect_old
         old_task = asyncio.create_task(old_ping())
         try:
             self._bind_ping_task(old_websocket, old_task)
             interruption_task = asyncio.create_task(
                 self.data_source._on_order_stream_interruption(old_websocket)
             )
-            await old_disconnect_started.wait()
-
             old_ping_release.set()
-            await old_task
-            await asyncio.sleep(0)
+            await interruption_task
             replacement_websocket = AsyncMock()
             replacement_task = asyncio.create_task(asyncio.sleep(10))
             self._bind_ping_task(replacement_websocket, replacement_task)
 
-            old_disconnect_release.set()
-            await interruption_task
+            await self.data_source._on_order_stream_interruption(old_websocket)
 
             self.assertIs(replacement_task, self.data_source._ping_task)
             self.assertFalse(replacement_task.done())
@@ -227,7 +216,6 @@ class PacificaPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCas
             await asyncio.gather(replacement_task, return_exceptions=True)
         finally:
             old_ping_release.set()
-            old_disconnect_release.set()
             await asyncio.gather(old_task, return_exceptions=True)
 
     async def test_cleanup_failure_never_replaces_ping_disconnect_outcome(self):

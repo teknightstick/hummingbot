@@ -3,7 +3,7 @@ import inspect
 import logging
 import time
 import weakref
-from typing import Any, Awaitable, Callable, Dict, Optional, Set, Tuple, TypeVar
+from typing import Any, Awaitable, Callable, Dict, FrozenSet, Optional, Set, Tuple, TypeVar
 
 
 _Result = TypeVar("_Result")
@@ -30,6 +30,10 @@ class GenerationOwnedTaskOwner:
         self._cancellation_requested_tasks: weakref.WeakSet = weakref.WeakSet()
         self._handled_tasks: weakref.WeakSet = weakref.WeakSet()
         self._end_requested_generation_ids: Set[int] = set()
+        self._generation_released = asyncio.Event()
+        self._generation_released.set()
+        self._task_creation_in_progress = False
+        self._task_creation_reentered = False
 
     @property
     def current_task(self) -> Optional[asyncio.Task]:
@@ -37,44 +41,127 @@ class GenerationOwnedTaskOwner:
         return self._current_task
 
     @property
-    def residual_tasks(self) -> Set[asyncio.Task]:
+    def residual_tasks(self) -> FrozenSet[asyncio.Task]:
         self._prune_finished_tasks()
-        return self._residual_tasks
+        return frozenset(self._residual_tasks)
 
     def begin_generation(self, generation: object):
+        if generation is None:
+            raise ValueError("A task generation must have an identity")
         self._prune_finished_tasks()
+        if self._current_generation is generation:
+            return
+        if self._current_generation is not None:
+            raise RuntimeError("Cannot start a task generation before its predecessor teardown is complete")
         live_task = self._live_task()
         if live_task is not None:
-            existing = self.task_for(generation)
-            if existing is live_task:
-                return
             raise RuntimeError("Cannot start a task generation while its predecessor is still owned")
         self._current_generation = generation
+        self._generation_released.clear()
 
-    def bind_task(self, generation: object, task: asyncio.Task):
-        self.begin_generation(generation)
+    def bind_task(self, generation: object, task: asyncio.Task) -> asyncio.Task:
         existing = self.task_for(generation)
         if existing is task:
-            return
-        if existing is not None and not existing.done():
-            raise RuntimeError("The generation already owns a live task")
-        self._bind_task(generation, task)
+            return task
+        return self.create_task(generation, lambda: task)
 
     def create_task(self, generation: object, task_factory: Callable[[], asyncio.Task]) -> asyncio.Task:
-        """Validate ownership before synchronously creating and binding a task."""
-        self.begin_generation(generation)
+        """Create and publish exactly one generation-owned task as a transaction."""
+        if self._task_creation_in_progress:
+            self._task_creation_reentered = True
+            raise RuntimeError("Reentrant task creation is not allowed")
+
+        self._prune_finished_tasks()
+        if generation is None:
+            raise ValueError("A task generation must have an identity")
+        if self._current_generation is not None and self._current_generation is not generation:
+            raise RuntimeError("Cannot start a task generation before its predecessor teardown is complete")
         existing = self.task_for(generation)
         if existing is not None and not existing.done():
             raise RuntimeError("The generation already owns a live task")
-        task = task_factory()
-        self._bind_task(generation, task)
-        return task
+        live_task = self._live_task()
+        if live_task is not None:
+            raise RuntimeError("Cannot start a task generation while its predecessor is still owned")
 
-    def _bind_task(self, generation: object, task: asyncio.Task):
-        self._tasks_by_generation[id(generation)] = (generation, task)
-        self._current_generation = generation
-        self._current_task = task
-        task.add_done_callback(self._task_done)
+        previous_tasks_by_generation = self._tasks_by_generation.copy()
+        previous_current_generation = self._current_generation
+        previous_current_task = self._current_task
+        previous_end_requests = self._end_requested_generation_ids.copy()
+        generation_was_released = self._generation_released.is_set()
+        task = None
+        callback_state = {"aborted": False, "published": False, "completed": False}
+
+        def task_done(done_task: asyncio.Task):
+            if callback_state["aborted"]:
+                return
+            if not callback_state["published"]:
+                callback_state["completed"] = True
+                return
+            self._task_done(done_task)
+
+        self._task_creation_in_progress = True
+        self._task_creation_reentered = False
+        try:
+            task = task_factory()
+            if self._task_creation_reentered:
+                raise RuntimeError("Reentrant task creation is not allowed")
+            if not isinstance(task, asyncio.Task):
+                raise TypeError("The task factory must return an asyncio.Task")
+
+            task.add_done_callback(task_done)
+            self._tasks_by_generation[id(generation)] = (generation, task)
+            self._current_generation = generation
+            self._current_task = task
+            self._generation_released.clear()
+            callback_state["published"] = True
+            if callback_state["completed"]:
+                self._task_done(task)
+            return task
+        except BaseException:
+            callback_state["aborted"] = True
+            self._tasks_by_generation = previous_tasks_by_generation
+            self._current_generation = previous_current_generation
+            self._current_task = previous_current_task
+            self._end_requested_generation_ids = previous_end_requests
+            if generation_was_released:
+                self._generation_released.set()
+            else:
+                self._generation_released.clear()
+            if isinstance(task, asyncio.Task):
+                self._cancel_and_retrieve_unpublished_task(task)
+            elif inspect.iscoroutine(task):
+                task.close()
+            raise
+        finally:
+            self._task_creation_in_progress = False
+            self._task_creation_reentered = False
+
+    def _cancel_and_retrieve_unpublished_task(self, task: asyncio.Task):
+        if not task.done():
+            task.cancel()
+        try:
+            asyncio.Task.add_done_callback(task, self._retrieve_unpublished_task_result)
+        except BaseException as callback_error:
+            if task.done():
+                self._retrieve_unpublished_task_result(task)
+            else:
+                self._logger.error(
+                    "Could not install cleanup for an unpublished generation-owned task",
+                    exc_info=(type(callback_error), callback_error, callback_error.__traceback__),
+                )
+
+    def _retrieve_unpublished_task_result(self, task: asyncio.Task):
+        if task.cancelled():
+            return
+        try:
+            exception = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exception is not None:
+            self._logger.error(
+                self._cleanup_error_message,
+                exc_info=(type(exception), exception, exception.__traceback__),
+            )
 
     def task_for(self, generation: object) -> Optional[asyncio.Task]:
         entry = self._tasks_by_generation.get(id(generation))
@@ -83,10 +170,10 @@ class GenerationOwnedTaskOwner:
         return entry[1]
 
     def is_current_generation(self, generation: object) -> bool:
-        return self._current_generation is generation
+        return generation is not None and self._current_generation is generation
 
     def end_generation(self, generation: object):
-        if self._current_generation is not generation:
+        if generation is None or self._current_generation is not generation:
             return
         generation_id = id(generation)
         generation_task = self.task_for(generation)
@@ -95,14 +182,18 @@ class GenerationOwnedTaskOwner:
             return
         self._current_generation = None
         self._end_requested_generation_ids.discard(generation_id)
+        self._generation_released.set()
 
     async def wait_until_released(self):
         while True:
             live_task = self._live_task()
-            if live_task is None:
+            if live_task is not None:
+                await asyncio.wait({live_task})
+                self._finalize_task(live_task)
+                continue
+            if self._current_generation is None:
                 return
-            await asyncio.wait({live_task})
-            self._finalize_task(live_task)
+            await self._generation_released.wait()
 
     async def cleanup(self, task: asyncio.Task, timeout: float):
         if not task.done() and task not in self._cancellation_requested_tasks:
@@ -172,6 +263,7 @@ class GenerationOwnedTaskOwner:
                 self._end_requested_generation_ids.discard(generation_id)
                 if self._current_generation is generation and self.task_for(generation) is None:
                     self._current_generation = None
+                    self._generation_released.set()
         try:
             self._on_task_done(task)
         except BaseException as callback_error:

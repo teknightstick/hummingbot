@@ -301,8 +301,8 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
         Connects to the trade events and order diffs websocket endpoints and listens to the messages sent by the
         exchange. Each message is stored in its own queue.
         """
-        ws: Optional[WSAssistant] = None
         while True:
+            ws: Optional[WSAssistant] = None
             try:
                 ws: WSAssistant = await self._connected_websocket_assistant()
                 self._ws_assistant = ws  # Store reference for incremental subscriptions
