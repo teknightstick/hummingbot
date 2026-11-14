@@ -55,6 +55,205 @@ class TestCandlesBaseInterruption(IsolatedAsyncioWrapperTestCase):
                 cancellations.append("cancelled")
                 cancellation_seen.set()
 
+    def _bind_fill_task(self, websocket_assistant, fill_task):
+        self.data_feed._start_candle_generation(websocket_assistant)
+        self.data_feed._bind_fill_candles_task(websocket_assistant, fill_task)
+
+    async def test_stop_network_retains_one_stubborn_fill_until_release(self):
+        websocket_assistant = AsyncMock()
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+        cancellations = []
+        fill_task = asyncio.create_task(
+            self._cancellation_suppressing_fill(started, cancellation_seen, release, cancellations)
+        )
+        try:
+            self._bind_fill_task(websocket_assistant, fill_task)
+            await started.wait()
+
+            with patch.object(type(self.data_feed), "_FILL_CANDLES_TASK_CLEANUP_TIMEOUT", 0.01):
+                await self.data_feed.stop_network()
+                await cancellation_seen.wait()
+                await self.data_feed.stop_network()
+
+            self.assertIs(fill_task, self.data_feed._fill_candles_task)
+            self.assertEqual({fill_task}, self.data_feed._residual_fill_candles_tasks)
+            self.assertEqual(["cancelled"], cancellations)
+
+            release.set()
+            await fill_task
+            await asyncio.sleep(0)
+
+            self.assertIsNone(self.data_feed._fill_candles_task)
+            self.assertEqual(set(), self.data_feed._residual_fill_candles_tasks)
+
+            replacement_ws = AsyncMock()
+            replacement_task = asyncio.create_task(asyncio.sleep(10))
+            self._bind_fill_task(replacement_ws, replacement_task)
+            self.assertIs(replacement_task, self.data_feed._fill_candles_task)
+            replacement_task.cancel()
+            await asyncio.gather(replacement_task, return_exceptions=True)
+        finally:
+            release.set()
+            await asyncio.gather(fill_task, return_exceptions=True)
+
+    async def test_stale_hook_entering_after_replacement_preserves_replacement_state(self):
+        old_websocket = AsyncMock()
+        old_disconnect_started = asyncio.Event()
+        old_disconnect_release = asyncio.Event()
+        old_fill_release = asyncio.Event()
+
+        async def disconnect_old():
+            old_disconnect_started.set()
+            await old_disconnect_release.wait()
+
+        async def old_fill():
+            await old_fill_release.wait()
+
+        old_websocket.disconnect.side_effect = disconnect_old
+        old_task = asyncio.create_task(old_fill())
+        try:
+            self._bind_fill_task(old_websocket, old_task)
+            interruption_task = asyncio.create_task(
+                self.data_feed._on_order_stream_interruption(old_websocket)
+            )
+            await old_disconnect_started.wait()
+
+            old_fill_release.set()
+            await old_task
+            await asyncio.sleep(0)
+
+            replacement_websocket = AsyncMock()
+            replacement_task = asyncio.create_task(asyncio.sleep(10))
+            self._bind_fill_task(replacement_websocket, replacement_task)
+            replacement_candle = [230.0] * len(self.data_feed.columns)
+            self.data_feed._candles.append(replacement_candle)
+            self.data_feed._ws_candle_available.set()
+
+            old_disconnect_release.set()
+            await interruption_task
+
+            self.assertIs(replacement_task, self.data_feed._fill_candles_task)
+            self.assertFalse(replacement_task.done())
+            self.assertTrue(self.data_feed._ws_candle_available.is_set())
+            self.assertEqual([replacement_candle], list(self.data_feed._candles))
+            replacement_task.cancel()
+            await asyncio.gather(replacement_task, return_exceptions=True)
+        finally:
+            old_fill_release.set()
+            old_disconnect_release.set()
+            await asyncio.gather(old_task, return_exceptions=True)
+
+    async def test_residual_fill_gates_listener_reconnect_until_release(self):
+        old_websocket = AsyncMock()
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+        fill_task = asyncio.create_task(
+            self._cancellation_suppressing_fill(started, cancellation_seen, release, [])
+        )
+        self._bind_fill_task(old_websocket, fill_task)
+        await started.wait()
+
+        with patch.object(type(self.data_feed), "_FILL_CANDLES_TASK_CLEANUP_TIMEOUT", 0.01):
+            await self.data_feed.stop_network()
+        await cancellation_seen.wait()
+
+        replacement_websocket = AsyncMock()
+        process_started = asyncio.Event()
+
+        async def process_messages(websocket_assistant):
+            process_started.set()
+            await asyncio.Future()
+
+        with patch.object(
+            self.data_feed,
+            "_connected_websocket_assistant",
+            new=AsyncMock(return_value=replacement_websocket),
+        ) as connect_mock, patch.object(
+            self.data_feed,
+            "_subscribe_channels",
+            new=AsyncMock(),
+        ), patch.object(
+            self.data_feed,
+            "_process_websocket_messages",
+            side_effect=process_messages,
+        ):
+            listener_task = asyncio.create_task(self.data_feed.listen_for_subscriptions())
+            await asyncio.sleep(0)
+            connect_mock.assert_not_awaited()
+
+            release.set()
+            await fill_task
+            await asyncio.wait_for(process_started.wait(), timeout=0.1)
+            connect_mock.assert_awaited_once_with()
+
+            listener_task.cancel()
+            await asyncio.gather(listener_task, return_exceptions=True)
+
+    async def test_cleanup_failure_does_not_replace_disconnect_return(self):
+        websocket_assistant = AsyncMock()
+        fill_task = asyncio.create_task(asyncio.sleep(10))
+        self._bind_fill_task(websocket_assistant, fill_task)
+
+        with patch.object(
+            self.data_feed,
+            "_cleanup_fill_candles_task",
+            new=AsyncMock(side_effect=RuntimeError("cleanup-secondary")),
+        ):
+            result = await self.data_feed._on_order_stream_interruption(websocket_assistant)
+
+        self.assertIs(websocket_assistant.disconnect.return_value, result)
+        self.assertTrue(self._is_logged("ERROR", "Error while cleaning up the fill candles task owner"))
+        fill_task.cancel()
+        await asyncio.gather(fill_task, return_exceptions=True)
+
+    async def test_cleanup_failure_does_not_replace_exact_disconnect_error(self):
+        websocket_assistant = AsyncMock()
+        primary = ValueError("disconnect-primary")
+        websocket_assistant.disconnect.side_effect = primary
+        fill_task = asyncio.create_task(asyncio.sleep(10))
+        self._bind_fill_task(websocket_assistant, fill_task)
+
+        with patch.object(
+            self.data_feed,
+            "_cleanup_fill_candles_task",
+            new=AsyncMock(side_effect=RuntimeError("cleanup-secondary")),
+        ):
+            with self.assertRaises(ValueError) as context:
+                await self.data_feed._on_order_stream_interruption(websocket_assistant)
+
+        self.assertIs(primary, context.exception)
+        fill_task.cancel()
+        await asyncio.gather(fill_task, return_exceptions=True)
+
+    async def test_cleanup_failure_does_not_replace_disconnect_cancellation_args(self):
+        websocket_assistant = AsyncMock()
+        websocket_assistant.disconnect.side_effect = asyncio.CancelledError("disconnect-cancel", 230)
+        fill_task = asyncio.create_task(asyncio.sleep(10))
+        self._bind_fill_task(websocket_assistant, fill_task)
+        cancellation_args = []
+
+        async def interrupt():
+            try:
+                await self.data_feed._on_order_stream_interruption(websocket_assistant)
+            except asyncio.CancelledError as cancellation:
+                cancellation_args.append(cancellation.args)
+                raise
+
+        with patch.object(
+            self.data_feed,
+            "_cleanup_fill_candles_task",
+            new=AsyncMock(side_effect=RuntimeError("cleanup-secondary")),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await interrupt()
+
+        self.assertEqual([("disconnect-cancel", 230)], cancellation_args)
+        fill_task.cancel()
+        await asyncio.gather(fill_task, return_exceptions=True)
+
     async def test_disconnect_error_still_cleans_exact_fill_task(self):
         fill_started = asyncio.Event()
         finalized = []
@@ -71,8 +270,8 @@ class TestCandlesBaseInterruption(IsolatedAsyncioWrapperTestCase):
                 finalized.append("finalized")
 
         fill_task = asyncio.create_task(running_fill())
-        self.data_feed._fill_candles_task = fill_task
         websocket_assistant = AsyncMock()
+        self._bind_fill_task(websocket_assistant, fill_task)
         websocket_assistant.disconnect.side_effect = RuntimeError("disconnect failed")
         await fill_started.wait()
 
@@ -109,7 +308,7 @@ class TestCandlesBaseInterruption(IsolatedAsyncioWrapperTestCase):
 
         websocket_assistant.disconnect.side_effect = disconnect
         old_task = asyncio.create_task(old_fill())
-        self.data_feed._fill_candles_task = old_task
+        self._bind_fill_task(websocket_assistant, old_task)
         await old_started.wait()
         interruption_task = asyncio.create_task(
             self.data_feed._on_order_stream_interruption(websocket_assistant)
@@ -117,6 +316,9 @@ class TestCandlesBaseInterruption(IsolatedAsyncioWrapperTestCase):
         await disconnect_started.wait()
         replacement_task = asyncio.create_task(asyncio.sleep(10))
         self.data_feed._fill_candles_task = replacement_task
+        replacement_candle = [230.0] * len(self.data_feed.columns)
+        self.data_feed._candles.append(replacement_candle)
+        self.data_feed._ws_candle_available.set()
 
         disconnect_release.set()
         await interruption_task
@@ -126,6 +328,8 @@ class TestCandlesBaseInterruption(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(old_task.cancelled())
         self.assertIs(replacement_task, self.data_feed._fill_candles_task)
         self.assertFalse(replacement_task.done())
+        self.assertTrue(self.data_feed._ws_candle_available.is_set())
+        self.assertEqual([replacement_candle], list(self.data_feed._candles))
         replacement_task.cancel()
         await asyncio.gather(replacement_task, return_exceptions=True)
 
@@ -137,12 +341,13 @@ class TestCandlesBaseInterruption(IsolatedAsyncioWrapperTestCase):
         fill_task = asyncio.create_task(
             self._cancellation_suppressing_fill(started, cancellation_seen, release, cancellations)
         )
-        self.data_feed._fill_candles_task = fill_task
+        websocket_assistant = AsyncMock()
+        self._bind_fill_task(websocket_assistant, fill_task)
         await started.wait()
 
         with patch.object(type(self.data_feed), "_FILL_CANDLES_TASK_CLEANUP_TIMEOUT", 0.01, create=True):
             interruption_task = asyncio.create_task(
-                self.data_feed._on_order_stream_interruption(AsyncMock())
+                self.data_feed._on_order_stream_interruption(websocket_assistant)
             )
             await cancellation_seen.wait()
             _, pending = await asyncio.wait({interruption_task}, timeout=0.1)
@@ -166,13 +371,14 @@ class TestCandlesBaseInterruption(IsolatedAsyncioWrapperTestCase):
         fill_task = asyncio.create_task(
             self._cancellation_suppressing_fill(started, cancellation_seen, release, cancellations)
         )
-        self.data_feed._fill_candles_task = fill_task
+        websocket_assistant = AsyncMock()
+        self._bind_fill_task(websocket_assistant, fill_task)
         await started.wait()
         owner_cancellation_args = []
 
         async def run_interruption():
             try:
-                await self.data_feed._on_order_stream_interruption(AsyncMock())
+                await self.data_feed._on_order_stream_interruption(websocket_assistant)
             except asyncio.CancelledError as cancellation:
                 owner_cancellation_args.append(cancellation.args)
                 raise
@@ -696,13 +902,15 @@ class TestCandlesBase(IsolatedAsyncioWrapperTestCase, ABC):
         # Skip for subclasses that override stop_network (e.g. BtcMarketsSpotCandles)
         if type(self.data_feed).stop_network is not CandlesBase.stop_network:
             return
-        mock_task = MagicMock()
-        self.data_feed._fill_candles_task = mock_task
+        fill_task = asyncio.create_task(asyncio.sleep(10))
+        websocket_assistant = AsyncMock()
+        self.data_feed._start_candle_generation(websocket_assistant)
+        self.data_feed._bind_fill_candles_task(websocket_assistant, fill_task)
         self.data_feed._listen_candles_task = None
 
         await self.data_feed.stop_network()
 
-        mock_task.cancel.assert_called_once()
+        self.assertTrue(fill_task.cancelled())
         self.assertIsNone(self.data_feed._fill_candles_task)
 
     async def test_fill_historical_candles_skips_when_candles_empty(self):

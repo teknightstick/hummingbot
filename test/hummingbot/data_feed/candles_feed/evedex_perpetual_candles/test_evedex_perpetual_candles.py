@@ -408,6 +408,7 @@ class TestEvedexPerpetualCandles(TestCandlesBase):
 
         ws = MagicMock()
         ws.disconnect = AsyncMock()
+        self.data_feed._start_candle_generation(ws)
 
         await self.data_feed._on_order_stream_interruption(ws)
         await asyncio.sleep(0)

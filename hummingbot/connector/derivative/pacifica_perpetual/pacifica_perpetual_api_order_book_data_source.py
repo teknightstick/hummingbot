@@ -11,7 +11,7 @@ from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.funding_info import FundingInfo, FundingInfoUpdate
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.perpetual_api_order_book_data_source import PerpetualAPIOrderBookDataSource
-from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.core.utils.async_utils import GenerationOwnedTaskOwner, await_primary_then_cleanup, safe_ensure_future
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
@@ -39,7 +39,17 @@ class PacificaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         self._api_factory = api_factory
         self._domain = domain
         self._ping_task: Optional[asyncio.Task] = None
-        self._residual_ping_tasks = set()
+        self._ping_connection_lock = asyncio.Lock()
+        self._ping_task_owner = GenerationOwnedTaskOwner(
+            logger=self.logger(),
+            cleanup_error_message="Error while cleaning up the Pacifica WebSocket ping task",
+            residual_warning_message=(
+                "Pacifica WebSocket ping task did not stop before the cleanup deadline; "
+                "retaining residual ownership."
+            ),
+            on_task_done=self._release_ping_task,
+        )
+        self._residual_ping_tasks = self._ping_task_owner.residual_tasks
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
@@ -178,11 +188,22 @@ class PacificaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         )
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
-        ws: WSAssistant = await self._api_factory.get_ws_assistant()
+        async with self._ping_connection_lock:
+            await self._ping_task_owner.wait_until_released()
+            ws: WSAssistant = await self._api_factory.get_ws_assistant()
 
-        await ws.connect(ws_url=web_utils.wss_url(self._domain), ws_headers=self._get_headers())
-        self._ping_task = safe_ensure_future(self._ping_loop(ws))
-        return ws
+            await ws.connect(ws_url=web_utils.wss_url(self._domain), ws_headers=self._get_headers())
+            ping_task = safe_ensure_future(self._ping_loop(ws))
+            self._bind_ping_task(ws, ping_task)
+            return ws
+
+    def _bind_ping_task(self, websocket_assistant: WSAssistant, ping_task: asyncio.Task):
+        self._ping_task_owner.bind_task(websocket_assistant, ping_task)
+        self._ping_task = ping_task
+
+    def _release_ping_task(self, ping_task: asyncio.Task):
+        if self._ping_task is ping_task:
+            self._ping_task = None
 
     async def _subscribe_channels(self, ws: WSAssistant):
         try:
@@ -233,57 +254,19 @@ class PacificaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             raise
 
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
-        ping_task = self._ping_task
+        ping_task = self._ping_task_owner.task_for(websocket_assistant)
         try:
-            await super()._on_order_stream_interruption(websocket_assistant)
-        finally:
-            if ping_task is not None:
-                await self._cleanup_ping_task(ping_task)
-
-    def _ping_task_done(self, ping_task: asyncio.Task):
-        self._residual_ping_tasks.discard(ping_task)
-        if self._ping_task is ping_task:
-            self._ping_task = None
-        if ping_task.cancelled():
-            return
-        try:
-            exception = ping_task.exception()
-        except asyncio.CancelledError:
-            return
-        if exception is not None:
-            self.logger().error(
-                "Error while cleaning up the Pacifica WebSocket ping task",
-                exc_info=(type(exception), exception, exception.__traceback__),
+            return await await_primary_then_cleanup(
+                primary=super()._on_order_stream_interruption(websocket_assistant),
+                cleanup=(lambda: self._cleanup_ping_task(ping_task)) if ping_task is not None else None,
+                logger=self.logger(),
+                cleanup_error_message="Error while cleaning up the Pacifica ping task owner",
             )
+        finally:
+            self._ping_task_owner.end_generation(websocket_assistant)
 
     async def _cleanup_ping_task(self, ping_task: asyncio.Task):
-        if not ping_task.done() and ping_task not in self._residual_ping_tasks:
-            ping_task.cancel()
-
-        owner_cancellation = None
-        deadline = asyncio.get_running_loop().time() + self._PING_TASK_CLEANUP_TIMEOUT
-        while not ping_task.done():
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                break
-            try:
-                await asyncio.wait({ping_task}, timeout=remaining)
-            except asyncio.CancelledError as cancellation:
-                if owner_cancellation is None:
-                    owner_cancellation = cancellation
-
-        if ping_task.done():
-            self._ping_task_done(ping_task)
-        else:
-            if ping_task not in self._residual_ping_tasks:
-                self._residual_ping_tasks.add(ping_task)
-                ping_task.add_done_callback(self._ping_task_done)
-            self.logger().warning(
-                "Pacifica WebSocket ping task did not stop before the cleanup deadline; retaining residual ownership."
-            )
-
-        if owner_cancellation is not None:
-            raise owner_cancellation
+        await self._ping_task_owner.cleanup(ping_task, timeout=self._PING_TASK_CLEANUP_TIMEOUT)
 
     async def _ping_loop(self, ws: WSAssistant):
         while True:

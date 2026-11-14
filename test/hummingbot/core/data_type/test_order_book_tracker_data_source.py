@@ -74,6 +74,28 @@ EXPECTED_ORDER_STREAM_DEFINITIONS = {
     "hummingbot/data_feed/liquidations_feed/liquidations_base.py:LiquidationsBase._on_order_stream_interruption",
 }
 
+ALTERNATE_LIFECYCLE_BOUNDARIES = {
+    "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
+    "BybitPerpetualAPIOrderBookDataSource.listen_for_subscriptions": {"tasks_future"},
+    "hummingbot/connector/derivative/injective_v2_perpetual/"
+    "injective_v2_perpetual_api_order_book_data_source.py:"
+    "InjectiveV2PerpetualAPIOrderBookDataSource.listen_for_subscriptions": {"start"},
+    "hummingbot/connector/exchange/bing_x/bing_x_api_order_book_data_source.py:"
+    "BingXAPIOrderBookDataSource.listen_for_subscriptions": {"disconnect"},
+    "hummingbot/connector/exchange/bybit/bybit_api_order_book_data_source.py:"
+    "BybitAPIOrderBookDataSource.listen_for_subscriptions": {"disconnect"},
+    "hummingbot/connector/exchange/injective_v2/injective_v2_api_order_book_data_source.py:"
+    "InjectiveV2APIOrderBookDataSource.listen_for_subscriptions": {"start"},
+    "hummingbot/connector/exchange/xrpl/xrpl_api_order_book_data_source.py:"
+    "XRPLAPIOrderBookDataSource.listen_for_subscriptions": {"_close_subscription_connection"},
+    "hummingbot/data_feed/candles_feed/btc_markets_spot_candles/btc_markets_spot_candles.py:"
+    "BtcMarketsSpotCandles.listen_for_subscriptions": {"_polling_task"},
+    "hummingbot/data_feed/candles_feed/lighter_perpetual_candles/lighter_perpetual_candles.py:"
+    "LighterPerpetualCandles.listen_for_subscriptions": {"fetch_candles"},
+    "hummingbot/data_feed/candles_feed/lighter_spot_candles/lighter_spot_candles.py:"
+    "LighterSpotCandles.listen_for_subscriptions": {"fetch_candles"},
+}
+
 
 class OrderStreamOverrideStaticTests(unittest.TestCase):
     @staticmethod
@@ -107,31 +129,88 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         if not isinstance(node, ast.Await) or not isinstance(node.value, ast.Call):
             return False
         function = node.value.func
-        return (
-            isinstance(function, ast.Attribute)
-            and function.attr in {"_on_order_stream_interruption", "disconnect"}
+        function_name = function.attr if isinstance(function, ast.Attribute) else (
+            function.id if isinstance(function, ast.Name) else None
         )
+        return (
+            function_name in {
+                "_on_order_stream_interruption",
+                "disconnect",
+                "await_primary_then_cleanup",
+            }
+        )
+
+    @staticmethod
+    def _awaited_name(node):
+        if not isinstance(node, ast.Await):
+            return None
+        awaited = node.value
+        if isinstance(awaited, ast.Name):
+            return awaited.id
+        if isinstance(awaited, ast.Attribute):
+            return awaited.attr
+        if not isinstance(awaited, ast.Call):
+            return None
+        function = awaited.func
+        return function.attr if isinstance(function, ast.Attribute) else (
+            function.id if isinstance(function, ast.Name) else None
+        )
+
+    @classmethod
+    def _is_lifecycle_boundary_await(cls, node, expected_names):
+        return cls._awaited_name(node) in expected_names
+
+    @staticmethod
+    def _expected_lifecycle_boundary_names(definition, function_node):
+        alternate_names = ALTERNATE_LIFECYCLE_BOUNDARIES.get(definition)
+        if alternate_names is not None:
+            return alternate_names
+        if function_node.name == "_on_order_stream_interruption":
+            return {"_on_order_stream_interruption", "disconnect", "await_primary_then_cleanup"}
+        if definition in EXPECTED_ORDER_STREAM_DEFINITIONS:
+            return {"_on_order_stream_interruption"}
+        return {"_on_order_stream_interruption", "disconnect", "await_primary_then_cleanup"}
 
     @classmethod
     def _is_owned_task_cleanup(cls, node):
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             attribute = cls._assigned_self_attribute(node)
-            return attribute is not None and attribute.endswith("_task") and isinstance(node.value, ast.Constant) \
+            target = node.targets[0] if isinstance(node, ast.Assign) and len(node.targets) == 1 else (
+                node.target if isinstance(node, ast.AnnAssign) else None
+            )
+            local_task_clear = (
+                isinstance(target, ast.Name)
+                and ("task" in target.id or target.id.endswith("_future"))
+                and isinstance(node.value, ast.Constant)
                 and node.value.value is None
+            )
+            return local_task_clear or (
+                attribute is not None
+                and attribute.endswith("_task")
+                and isinstance(node.value, ast.Constant)
+                and node.value.value is None
+            )
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "cancel":
             task = node.func.value
             return (
-                isinstance(task, ast.Attribute)
-                and isinstance(task.value, ast.Name)
-                and task.value.id == "self"
-                and task.attr.endswith("_task")
+                isinstance(task, ast.Name)
+                or (
+                    isinstance(task, ast.Attribute)
+                    and task.attr.endswith(("_task", "_future"))
+                )
             )
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            return node.func.attr in {"_cleanup_ping_task", "_cleanup_fill_candles_task"}
+        if isinstance(node, ast.Call):
+            function = node.func
+            function_name = function.attr if isinstance(function, ast.Attribute) else (
+                function.id if isinstance(function, ast.Name) else ""
+            )
+            return function_name.startswith("_cleanup") and "task" in function_name
         return False
 
     @staticmethod
     def _cleanup_is_in_finally_for_await(function_node, cleanup_node, await_node):
+        if any(nested is cleanup_node for nested in ast.walk(await_node)):
+            return True
         for try_node in (node for node in ast.walk(function_node) if isinstance(node, ast.Try)):
             await_is_in_body = any(
                 nested is await_node for statement in try_node.body for nested in ast.walk(statement)
@@ -143,6 +222,41 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 return True
         return False
 
+    def _audit_definition(self, definition, function_node):
+        for node in ast.walk(function_node):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                assigned_attribute = self._assigned_self_attribute(node)
+                clears_assistant = (
+                    assigned_attribute == "_ws_assistant"
+                    and isinstance(node.value, ast.Constant)
+                    and node.value.value is None
+                )
+                self.assertFalse(
+                    function_node.name == "_on_order_stream_interruption" and clears_assistant,
+                    f"{definition} must leave exact assistant identity cleanup to its owning listener",
+                )
+
+        expected_boundary_names = self._expected_lifecycle_boundary_names(definition, function_node)
+        lifecycle_awaits = [node for node in ast.walk(function_node)
+                            if self._is_lifecycle_boundary_await(node, expected_boundary_names)]
+        self.assertTrue(
+            lifecycle_awaits,
+            f"{definition} must contain a recognized awaited lifecycle boundary",
+        )
+
+        disconnect_awaits = [
+            node for node in ast.walk(function_node) if self._is_disconnect_boundary_await(node)
+        ]
+        task_cleanups = [node for node in ast.walk(function_node) if self._is_owned_task_cleanup(node)]
+        for disconnect_await in disconnect_awaits:
+            for task_cleanup in task_cleanups:
+                if task_cleanup.lineno <= disconnect_await.lineno:
+                    continue
+                self.assertTrue(
+                    self._cleanup_is_in_finally_for_await(function_node, task_cleanup, disconnect_await),
+                    f"{definition} must protect post-disconnect task cleanup with finally",
+                )
+
     def test_all_order_stream_definitions_obey_interruption_ownership_boundaries(self):
         definitions = self._production_definitions()
         self.assertEqual(EXPECTED_ORDER_STREAM_DEFINITIONS, set(definitions))
@@ -151,32 +265,43 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         audited_definitions = set()
         for definition, function_node in definitions.items():
             audited_definitions.add(definition)
-            for node in ast.walk(function_node):
-                if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                    assigned_attribute = self._assigned_self_attribute(node)
-                    clears_assistant = (
-                        assigned_attribute == "_ws_assistant"
-                        and isinstance(node.value, ast.Constant)
-                        and node.value.value is None
-                    )
-                    self.assertFalse(
-                        function_node.name == "_on_order_stream_interruption" and clears_assistant,
-                        f"{definition} must leave exact assistant identity cleanup to its owning listener",
-                    )
-
-            disconnect_awaits = [
-                node for node in ast.walk(function_node) if self._is_disconnect_boundary_await(node)
-            ]
-            task_cleanups = [node for node in ast.walk(function_node) if self._is_owned_task_cleanup(node)]
-            for disconnect_await in disconnect_awaits:
-                for task_cleanup in task_cleanups:
-                    if task_cleanup.lineno <= disconnect_await.lineno:
-                        continue
-                    self.assertTrue(
-                        self._cleanup_is_in_finally_for_await(function_node, task_cleanup, disconnect_await),
-                        f"{definition} must protect post-disconnect task cleanup with finally",
-                    )
+            self._audit_definition(definition, function_node)
         self.assertEqual(EXPECTED_ORDER_STREAM_DEFINITIONS, audited_definitions)
+
+    def test_static_audit_rejects_listener_without_awaited_lifecycle_boundary(self):
+        function_node = ast.parse(
+            "async def listen_for_subscriptions(self):\n"
+            "    self._listen_task.cancel()\n"
+        ).body[0]
+
+        with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+            self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+    def test_static_audit_rejects_deletion_of_expected_hook_when_other_awaits_remain(self):
+        definition = (
+            "hummingbot/core/data_type/order_book_tracker_data_source.py:"
+            "OrderBookTrackerDataSource.listen_for_subscriptions"
+        )
+        function_node = ast.parse(
+            "async def listen_for_subscriptions(self):\n"
+            "    websocket = await self._connected_websocket_assistant()\n"
+            "    await self._sleep(1)\n"
+            "    self._listen_task.cancel()\n"
+        ).body[0]
+
+        with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+            self._audit_definition(definition, function_node)
+
+    def test_static_audit_rejects_unsafe_exact_local_task_cleanup(self):
+        function_node = ast.parse(
+            "async def listen_for_subscriptions(self, websocket):\n"
+            "    task = self._listen_task\n"
+            "    await websocket.disconnect()\n"
+            "    task.cancel()\n"
+        ).body[0]
+
+        with self.assertRaisesRegex(AssertionError, "protect post-disconnect task cleanup"):
+            self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
 
 
 class _ControllableConnection:
