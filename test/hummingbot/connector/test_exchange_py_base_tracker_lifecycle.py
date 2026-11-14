@@ -332,6 +332,144 @@ class ExchangePyBaseTrackerLifecycleTests(IsolatedAsyncioWrapperTestCase):
             pending_cleanup = tuple(getattr(connector, "_network_tasks_to_drain", ()))
             await asyncio.gather(*pending_cleanup, return_exceptions=True)
 
+    async def test_child_inheriting_already_stopped_context_after_parent_return_still_stops(self):
+        class ChildDelegatingTracker(OrderBookTracker):
+            def __init__(self):
+                super().__init__(data_source=MagicMock(), trading_pairs=[])
+                self.child_release = asyncio.Event()
+                self.child_task = None
+
+            async def stop_and_wait(self):
+                self.child_task = asyncio.create_task(self._delegate_after_release())
+                return True
+
+            async def _delegate_after_release(self):
+                await self.child_release.wait()
+                return await super().stop_and_wait(timeout=0.2)
+
+        tracker = ChildDelegatingTracker()
+        stop = MagicMock(wraps=tracker.stop)
+        tracker.stop = stop
+        connector = self._connector(tracker)
+
+        self.assertIsNone(await ExchangePyBase.stop_network(connector))
+        stop.assert_called_once_with()
+
+        tracker.child_release.set()
+        self.assertTrue(await asyncio.wait_for(tracker.child_task, timeout=0.2))
+        self.assertEqual(2, stop.call_count)
+
+    async def test_child_inheriting_already_stopped_context_after_parent_cancel_still_stops(self):
+        class CancelledParentTracker(OrderBookTracker):
+            def __init__(self):
+                super().__init__(data_source=MagicMock(), trading_pairs=[])
+                self.parent_entered = asyncio.Event()
+                self.child_release = asyncio.Event()
+                self.child_task = None
+
+            async def stop_and_wait(self):
+                self.child_task = asyncio.create_task(self._delegate_after_release())
+                self.parent_entered.set()
+                await asyncio.Future()
+
+            async def _delegate_after_release(self):
+                await self.child_release.wait()
+                return await super().stop_and_wait(timeout=0.2)
+
+        tracker = CancelledParentTracker()
+        stop = MagicMock(wraps=tracker.stop)
+        tracker.stop = stop
+        tracker.stop()
+        token_parent = asyncio.create_task(
+            ExchangePyBase._wait_for_stopped_order_book_tracker(tracker)
+        )
+        await asyncio.wait_for(tracker.parent_entered.wait(), timeout=0.2)
+
+        token_parent.cancel("token-parent-cancelled")
+        with self.assertRaises(asyncio.CancelledError) as raised:
+            await token_parent
+        self.assertEqual(("token-parent-cancelled",), raised.exception.args)
+
+        tracker.child_release.set()
+        self.assertTrue(await asyncio.wait_for(tracker.child_task, timeout=0.2))
+        self.assertEqual(2, stop.call_count)
+
+    async def test_two_children_inheriting_one_already_stopped_context_both_stop(self):
+        class TwoChildDelegatingTracker(OrderBookTracker):
+            def __init__(self):
+                super().__init__(data_source=MagicMock(), trading_pairs=[])
+                self.children_release = asyncio.Event()
+                self.child_tasks = []
+
+            async def stop_and_wait(self):
+                self.child_tasks = [
+                    asyncio.create_task(self._delegate_after_release())
+                    for _ in range(2)
+                ]
+                return True
+
+            async def _delegate_after_release(self):
+                await self.children_release.wait()
+                return await super().stop_and_wait(timeout=0.2)
+
+        tracker = TwoChildDelegatingTracker()
+        stop = MagicMock(wraps=tracker.stop)
+        tracker.stop = stop
+        connector = self._connector(tracker)
+
+        self.assertIsNone(await ExchangePyBase.stop_network(connector))
+        stop.assert_called_once_with()
+
+        tracker.children_release.set()
+        results = await asyncio.wait_for(
+            asyncio.gather(*tracker.child_tasks),
+            timeout=0.2,
+        )
+        self.assertEqual([True, True], results)
+        self.assertEqual(3, stop.call_count)
+
+    async def test_child_inheriting_context_cannot_leave_restarted_tracker_running(self):
+        class RestartedChildDelegatingTracker(OrderBookTracker):
+            def __init__(self):
+                source = MagicMock()
+
+                async def wait_until_cancelled(*args, **kwargs):
+                    await asyncio.Future()
+
+                source.listen_for_order_book_diffs = AsyncMock(side_effect=wait_until_cancelled)
+                source.listen_for_trades = AsyncMock(side_effect=wait_until_cancelled)
+                source.listen_for_order_book_snapshots = AsyncMock(side_effect=wait_until_cancelled)
+                source.listen_for_subscriptions = AsyncMock(side_effect=wait_until_cancelled)
+                super().__init__(data_source=source, trading_pairs=[])
+                self.child_release = asyncio.Event()
+                self.child_task = None
+
+            async def stop_and_wait(self):
+                self.child_task = asyncio.create_task(self._delegate_after_release())
+                return True
+
+            async def _delegate_after_release(self):
+                await self.child_release.wait()
+                return await super().stop_and_wait(timeout=0.2)
+
+        tracker = RestartedChildDelegatingTracker()
+        stop = MagicMock(wraps=tracker.stop)
+        tracker.stop = stop
+        connector = self._connector(tracker)
+
+        self.assertIsNone(await ExchangePyBase.stop_network(connector))
+        tracker.start()
+        await asyncio.wait_for(tracker.wait_ready(), timeout=0.2)
+        self.assertIsNotNone(tracker._active_generation)
+        self.assertTrue(tracker.ready)
+        self.assertEqual(2, stop.call_count)
+
+        tracker.child_release.set()
+        self.assertTrue(await asyncio.wait_for(tracker.child_task, timeout=0.2))
+        self.assertEqual(3, stop.call_count)
+        self.assertIsNone(tracker._active_generation)
+        self.assertFalse(tracker.ready)
+
     async def test_concurrent_connector_stops_each_use_one_public_one_shot_dispatch(self):
         class CountingTracker(OrderBookTracker):
             def __init__(self):

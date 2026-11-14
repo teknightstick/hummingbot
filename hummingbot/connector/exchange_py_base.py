@@ -24,7 +24,10 @@ from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.data_type.order_book import OrderBook
-from hummingbot.core.data_type.order_book_tracker import OrderBookTracker
+from hummingbot.core.data_type.order_book_tracker import (
+    OrderBookTracker,
+    _OrderBookTrackerStopAuthorization,
+)
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
 from hummingbot.core.data_type.user_stream_tracker import UserStreamTracker
@@ -962,12 +965,17 @@ class ExchangePyBase(ExchangeBase, ABC):
 
     @staticmethod
     async def _wait_for_stopped_order_book_tracker(tracker: OrderBookTracker) -> bool:
-        already_stopped_context = tracker._stop_and_wait_already_stopped_context
-        reset_token = already_stopped_context.set(object())
+        authorization_context = tracker._stop_and_wait_authorization_context
+        authorization = _OrderBookTrackerStopAuthorization(
+            tracker=tracker,
+            owner=asyncio.current_task(),
+        )
+        reset_token = authorization_context.set(authorization)
         try:
             return await tracker.stop_and_wait()
         finally:
-            already_stopped_context.reset(reset_token)
+            authorization.active = False
+            authorization_context.reset(reset_token)
 
     @staticmethod
     def _begin_network_task_publication_scan(connector):
