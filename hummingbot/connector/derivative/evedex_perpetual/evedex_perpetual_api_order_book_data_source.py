@@ -10,6 +10,7 @@ from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.funding_info import FundingInfo, FundingInfoUpdate
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.perpetual_api_order_book_data_source import PerpetualAPIOrderBookDataSource
+from hummingbot.core.utils.async_utils import GenerationOwnedTaskOwner, await_primary_then_cleanup
 from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
 
 class EvedexPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
     _logger: Optional[HummingbotLogger] = None
+    _PING_TASK_CLEANUP_TIMEOUT = 1.0
 
     def __init__(
             self,
@@ -43,6 +45,14 @@ class EvedexPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         self._ws_symbol_to_trading_pair: Dict[str, str] = {}
         # Ping task for keeping Centrifugo connection alive
         self._ping_task: Optional[asyncio.Task] = None
+        self._ping_task_owner = GenerationOwnedTaskOwner(
+            logger=self.logger(),
+            cleanup_error_message="Error while cleaning up the EVEDEX WebSocket ping task",
+            residual_warning_message=(
+                "EVEDEX WebSocket ping task did not stop before the cleanup deadline; retaining residual ownership."
+            ),
+            on_task_done=self._release_ping_task,
+        )
         self._ws_assistant: Optional[WSAssistant] = None
 
     async def get_last_traded_prices(self,
@@ -146,13 +156,9 @@ class EvedexPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         # Cancel any existing ping task
-        if self._ping_task is not None and not self._ping_task.done():
-            self._ping_task.cancel()
-            try:
-                await self._ping_task
-            except asyncio.CancelledError:
-                pass
-            self._ping_task = None
+        ping_task = self._ping_task
+        if ping_task is not None:
+            await self._cleanup_ping_task(ping_task)
 
         url = web_utils.wss_url(self._domain)
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
@@ -489,13 +495,26 @@ class EvedexPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         Called when the order book stream gets interrupted.
         Cleans up the ping task and connection state.
         """
-        # Cancel the ping task
-        if self._ping_task is not None and not self._ping_task.done():
-            self._ping_task.cancel()
-            try:
-                await self._ping_task
-            except asyncio.CancelledError:
-                pass
+        ping_task = self._ping_task
+        return await await_primary_then_cleanup(
+            primary=super()._on_order_stream_interruption(websocket_assistant=websocket_assistant),
+            cleanup=(lambda: self._cleanup_ping_task(ping_task)) if ping_task is not None else None,
+            logger=self.logger(),
+            cleanup_error_message="Error while cleaning up the EVEDEX ping task owner",
+        )
+
+    @property
+    def _residual_ping_tasks(self):
+        return self._ping_task_owner.residual_tasks
+
+    def _release_ping_task(self, ping_task: asyncio.Task):
+        if self._ping_task is ping_task:
             self._ping_task = None
 
-        await super()._on_order_stream_interruption(websocket_assistant=websocket_assistant)
+    async def _cleanup_ping_task(self, ping_task: asyncio.Task):
+        if self._ping_task_owner.task_for(ping_task) is None:
+            self._ping_task_owner.bind_task(ping_task, ping_task)
+        try:
+            await self._ping_task_owner.cleanup(ping_task, timeout=self._PING_TASK_CLEANUP_TIMEOUT)
+        finally:
+            self._ping_task_owner.end_generation(ping_task)

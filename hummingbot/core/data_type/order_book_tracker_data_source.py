@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import sys
 import time
 from abc import ABCMeta, abstractmethod
 from collections import defaultdict
@@ -303,63 +302,34 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
         Connects to the trade events and order diffs websocket endpoints and listens to the messages sent by the
         exchange. Each message is stored in its own queue.
         """
-        try:
-            while True:
-                ws: Optional[WSAssistant] = None
+        while True:
+            ws: Optional[WSAssistant] = None
 
-                async def listen_on_websocket():
-                    nonlocal ws
-                    ws = await self._connected_websocket_assistant()
-                    self._ws_assistant = ws  # Store reference for incremental subscriptions
-                    await self._subscribe_channels(ws)
-                    return await self._process_websocket_messages(websocket_assistant=ws)
+            async def listen_on_websocket():
+                nonlocal ws
+                ws = await self._connected_websocket_assistant()
+                self._ws_assistant = ws  # Store reference for incremental subscriptions
+                await self._subscribe_channels(ws)
+                return await self._process_websocket_messages(websocket_assistant=ws)
 
+            try:
                 try:
-                    try:
-                        await await_primary_then_cleanup(
-                            primary=listen_on_websocket(),
-                            cleanup=lambda: self._on_order_stream_interruption(websocket_assistant=ws),
-                            logger=self.logger(),
-                            cleanup_error_message="Error while interrupting the order book stream",
-                        )
-                    finally:
-                        if self._ws_assistant is ws:
-                            self._ws_assistant = None
-                except ConnectionError as connection_exception:
-                    self.logger().warning(f"The websocket connection was closed ({connection_exception})")
-                except Exception:
-                    self.logger().exception(
-                        "Unexpected error occurred when listening to order book streams. Retrying in 5 seconds...",
+                    await await_primary_then_cleanup(
+                        primary=listen_on_websocket(),
+                        cleanup=lambda: self._on_order_stream_interruption(websocket_assistant=ws),
+                        logger=self.logger(),
+                        cleanup_error_message="Error while interrupting the order book stream",
                     )
-                    await self._sleep(1.0)
-        except asyncio.CancelledError as cancellation:
-            cancellation_args = cancellation.args
-            cancellation.args = cancellation_args
-            if sys.version_info < (3, 11) and len(cancellation_args) == 1:
-                # CPython 3.10's Task cancellation path drops the message after a
-                # CancelledError has been caught. Re-cancel and return without
-                # another suspension so Task's StopIteration path retains it.
-                # Only do this when this listener owns the task; a directly
-                # awaited listener must not cancel its caller's task.
-                current = asyncio.current_task()
-                root_coroutine = current.get_coro() if current is not None else None
-                root_code = getattr(root_coroutine, "cr_code", None)
-                root_frame = getattr(root_coroutine, "cr_frame", None)
-                tracker_wrapper_owns_listener = (
-                    root_code is not None
-                    and root_code.co_name == "_run_data_source_task"
-                    and root_frame is not None
-                    and root_frame.f_locals.get("method_name") == "listen_for_subscriptions"
-                    and getattr(root_frame.f_locals.get("self"), "_data_source", None) is self
+                finally:
+                    if self._ws_assistant is ws:
+                        self._ws_assistant = None
+            except ConnectionError as connection_exception:
+                self.logger().warning(f"The websocket connection was closed ({connection_exception})")
+            except Exception:
+                self.logger().exception(
+                    "Unexpected error occurred when listening to order book streams. Retrying in 5 seconds...",
                 )
-                owns_task = (
-                    root_code is OrderBookTrackerDataSource.listen_for_subscriptions.__code__
-                    or tracker_wrapper_owns_listener
-                )
-                if owns_task:
-                    current.cancel(cancellation_args[0])
-                    return
-            raise cancellation
+                await self._sleep(1.0)
 
     async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         """

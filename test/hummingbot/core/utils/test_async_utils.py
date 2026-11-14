@@ -1,6 +1,7 @@
 import asyncio
 import gc
 import logging
+import sys
 import weakref
 
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
@@ -412,6 +413,30 @@ class GenerationOwnedTaskOwnerTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(("primary cancellation",), cancellation_context.exception.args)
         self.assertTrue(cleanup_awaited)
         logger.error.assert_called_once()
+
+    async def test_cancelled_error_task_boundary_materialization_is_a_runtime_control(self):
+        primary_error = asyncio.CancelledError("substrate cancellation", 230)
+        caught_inside = []
+
+        async def raise_primary():
+            try:
+                raise primary_error
+            except asyncio.CancelledError as cancellation:
+                caught_inside.append(cancellation)
+                raise
+
+        task = asyncio.create_task(raise_primary())
+        with self.assertRaises(asyncio.CancelledError) as cancellation_context:
+            await task
+
+        self.assertEqual([primary_error], caught_inside)
+        self.assertIs(type(primary_error), type(cancellation_context.exception))
+        if sys.version_info < (3, 11):
+            self.assertIsNot(primary_error, cancellation_context.exception)
+            self.assertEqual((), cancellation_context.exception.args)
+        else:
+            self.assertIs(primary_error, cancellation_context.exception)
+            self.assertEqual(("substrate cancellation", 230), cancellation_context.exception.args)
 
     async def test_primary_cancellation_wins_over_secondary_cleanup_cancellation(self):
         logger = MagicMock()

@@ -8,6 +8,7 @@ This module tests:
 """
 import ast
 import asyncio
+import sys
 import unittest
 from pathlib import Path
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
@@ -78,6 +79,8 @@ EXPECTED_ORDER_STREAM_DEFINITIONS = {
 ALTERNATE_LIFECYCLE_BOUNDARIES = {
     "hummingbot/core/data_type/order_book_tracker_data_source.py:"
     "OrderBookTrackerDataSource.listen_for_subscriptions": {"await_primary_then_cleanup"},
+    "hummingbot/data_feed/candles_feed/candles_base.py:"
+    "CandlesBase.listen_for_subscriptions": {"await_primary_then_cleanup"},
     "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
     "BybitPerpetualAPIOrderBookDataSource.listen_for_subscriptions": {"tasks_future"},
     "hummingbot/connector/derivative/injective_v2_perpetual/"
@@ -139,11 +142,11 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         return None
 
     @classmethod
-    def _constant_value(cls, node):
+    def _constant_value(cls, node, shadowed_names=frozenset()):
         if isinstance(node, ast.Name) and node.id == "__debug__":
             return __debug__
         if isinstance(node, ast.UnaryOp):
-            operand = cls._constant_value(node.operand)
+            operand = cls._constant_value(node.operand, shadowed_names)
             if operand is cls._UNKNOWN:
                 return cls._UNKNOWN
             try:
@@ -161,7 +164,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         if isinstance(node, ast.BoolOp):
             result = cls._UNKNOWN
             for value_node in node.values:
-                value = cls._constant_value(value_node)
+                value = cls._constant_value(value_node, shadowed_names)
                 if value is cls._UNKNOWN:
                     return cls._UNKNOWN
                 if isinstance(node.op, ast.And) and not bool(value):
@@ -171,11 +174,11 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 result = value
             return result
         if isinstance(node, ast.Compare):
-            left = cls._constant_value(node.left)
+            left = cls._constant_value(node.left, shadowed_names)
             if left is cls._UNKNOWN:
                 return cls._UNKNOWN
             for operator, comparator_node in zip(node.ops, node.comparators):
-                right = cls._constant_value(comparator_node)
+                right = cls._constant_value(comparator_node, shadowed_names)
                 if right is cls._UNKNOWN:
                     return cls._UNKNOWN
                 try:
@@ -208,17 +211,18 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 left = right
             return True
         if isinstance(node, ast.IfExp):
-            truth_value = cls._constant_truth_value(node.test)
+            truth_value = cls._constant_truth_value(node.test, shadowed_names)
             if truth_value is None:
                 return cls._UNKNOWN
-            return cls._constant_value(node.body if truth_value else node.orelse)
+            return cls._constant_value(node.body if truth_value else node.orelse, shadowed_names)
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id == "range"
+            and "range" not in shadowed_names
             and not node.keywords
         ):
-            arguments = [cls._constant_value(argument) for argument in node.args]
+            arguments = [cls._constant_value(argument, shadowed_names) for argument in node.args]
             if all(argument is not cls._UNKNOWN for argument in arguments):
                 try:
                     return range(*arguments)
@@ -231,19 +235,34 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             and not node.args
             and not node.keywords
         ):
-            return set()
+            return cls._UNKNOWN if "set" in shadowed_names else set()
         try:
             return ast.literal_eval(node)
         except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
             return cls._UNKNOWN
 
     @classmethod
-    def _constant_truth_value(cls, node):
-        value = cls._constant_value(node)
+    def _constant_truth_value(cls, node, shadowed_names=frozenset()):
+        if isinstance(node, ast.BoolOp):
+            truth_values = [cls._constant_truth_value(value, shadowed_names) for value in node.values]
+            if isinstance(node.op, ast.And):
+                if False in truth_values:
+                    return False
+                return True if all(value is True for value in truth_values) else None
+            if isinstance(node.op, ast.Or):
+                if True in truth_values:
+                    return True
+                return False if all(value is False for value in truth_values) else None
+        value = cls._constant_value(node, shadowed_names)
         return None if value is cls._UNKNOWN else bool(value)
 
     @classmethod
-    def _executable_nodes_in_statements(cls, statements, shadowed_names=frozenset()):
+    def _executable_nodes_in_statements(
+        cls,
+        statements,
+        shadowed_names=frozenset(),
+        nonraising_names=frozenset(),
+    ):
         nodes = []
         node_ids = set()
 
@@ -251,6 +270,71 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             if id(node) not in node_ids:
                 node_ids.add(id(node))
                 nodes.append(node)
+
+        def constant_value(node):
+            return cls._constant_value(node, shadowed_names)
+
+        def constant_truth_value(node):
+            return cls._constant_truth_value(node, shadowed_names)
+
+        def target_binding_succeeds(target, value):
+            if isinstance(target, ast.Name):
+                return True
+            if isinstance(target, ast.Starred):
+                return target_binding_succeeds(target.value, value)
+            if not isinstance(target, (ast.Tuple, ast.List)):
+                return None
+            try:
+                values = list(value)
+            except TypeError:
+                return False
+
+            starred = [index for index, element in enumerate(target.elts) if isinstance(element, ast.Starred)]
+            if not starred:
+                if len(values) != len(target.elts):
+                    return False
+                pairs = zip(target.elts, values)
+            else:
+                starred_index = starred[0]
+                trailing = len(target.elts) - starred_index - 1
+                if len(values) < starred_index + trailing:
+                    return False
+                starred_end = len(values) - trailing
+                pairs = [
+                    *zip(target.elts[:starred_index], values[:starred_index]),
+                    (target.elts[starred_index], values[starred_index:starred_end]),
+                    *zip(target.elts[starred_index + 1:], values[len(values) - trailing:]),
+                ]
+            statuses = [target_binding_succeeds(element, item) for element, item in pairs]
+            if False in statuses:
+                return False
+            return None if None in statuses else True
+
+        def visit_comprehension(generators, index, visit_result):
+            generator = generators[index]
+            visit_expression(generator.iter)
+            iterable = constant_value(generator.iter)
+            if iterable is cls._UNKNOWN:
+                item = cls._UNKNOWN
+            else:
+                try:
+                    item = next(iter(iterable))
+                except StopIteration:
+                    return False
+                except TypeError:
+                    return False
+
+            visit_expression(generator.target)
+            if item is not cls._UNKNOWN and target_binding_succeeds(generator.target, item) is False:
+                return False
+            for condition in generator.ifs:
+                visit_expression(condition)
+                if constant_truth_value(condition) is False:
+                    return False
+            if index + 1 < len(generators):
+                return visit_comprehension(generators, index + 1, visit_result)
+            visit_result()
+            return True
 
         def visit_expression(node):
             if node is None:
@@ -265,30 +349,20 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                     visit_expression(node.generators[0].iter)
                 return
             if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp)):
-                for generator in node.generators:
-                    visit_expression(generator.iter)
-                    iterable = cls._constant_value(generator.iter)
-                    if iterable is not cls._UNKNOWN:
-                        try:
-                            if len(iterable) == 0:
-                                return
-                        except TypeError:
-                            pass
-                    visit_expression(generator.target)
-                    for condition in generator.ifs:
-                        visit_expression(condition)
-                        if cls._constant_truth_value(condition) is False:
-                            return
-                if isinstance(node, ast.DictComp):
-                    visit_expression(node.key)
-                    visit_expression(node.value)
-                else:
-                    visit_expression(node.elt)
+                def visit_result():
+                    if isinstance(node, ast.DictComp):
+                        visit_expression(node.key)
+                        visit_expression(node.value)
+                    else:
+                        visit_expression(node.elt)
+
+                if node.generators:
+                    visit_comprehension(node.generators, 0, visit_result)
                 return
             if isinstance(node, ast.BoolOp):
                 for value_node in node.values:
                     visit_expression(value_node)
-                    truth_value = cls._constant_truth_value(value_node)
+                    truth_value = constant_truth_value(value_node)
                     if isinstance(node.op, ast.And) and truth_value is False:
                         break
                     if isinstance(node.op, ast.Or) and truth_value is True:
@@ -296,7 +370,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 return
             if isinstance(node, ast.IfExp):
                 visit_expression(node.test)
-                truth_value = cls._constant_truth_value(node.test)
+                truth_value = constant_truth_value(node.test)
                 if truth_value is True:
                     visit_expression(node.body)
                 elif truth_value is False:
@@ -311,7 +385,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 for operator, comparator in zip(node.ops, node.comparators):
                     visit_expression(comparator)
                     single_comparison = ast.Compare(left=left, ops=[operator], comparators=[comparator])
-                    if cls._constant_truth_value(single_comparison) is False:
+                    if constant_truth_value(single_comparison) is False:
                         break
                     left = comparator
                 return
@@ -361,7 +435,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             if node is None or isinstance(node, ast.Constant):
                 return False
             if isinstance(node, ast.Name):
-                return node.id != "__debug__"
+                return node.id != "__debug__" and node.id not in nonraising_names
             if isinstance(node, ast.Lambda):
                 return any(expression_may_raise(default) for default in (*node.args.defaults, *node.args.kw_defaults))
             if isinstance(node, ast.GeneratorExp):
@@ -376,7 +450,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 for value_node in node.values:
                     if expression_may_raise(value_node):
                         return True
-                    truth_value = cls._constant_truth_value(value_node)
+                    truth_value = constant_truth_value(value_node)
                     if isinstance(node.op, ast.And) and truth_value is False:
                         return False
                     if isinstance(node.op, ast.Or) and truth_value is True:
@@ -385,7 +459,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             if isinstance(node, ast.IfExp):
                 if expression_may_raise(node.test):
                     return True
-                truth_value = cls._constant_truth_value(node.test)
+                truth_value = constant_truth_value(node.test)
                 if truth_value is True:
                     return expression_may_raise(node.body)
                 if truth_value is False:
@@ -399,7 +473,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                     if expression_may_raise(comparator):
                         return True
                     comparison = ast.Compare(left=left, ops=[operator], comparators=[comparator])
-                    truth_value = cls._constant_truth_value(comparison)
+                    truth_value = constant_truth_value(comparison)
                     if truth_value is None:
                         return True
                     if truth_value is False:
@@ -407,7 +481,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                     left = comparator
                 return False
             if isinstance(node, ast.UnaryOp):
-                return expression_may_raise(node.operand) or cls._constant_value(node) is cls._UNKNOWN
+                return expression_may_raise(node.operand) or constant_value(node) is cls._UNKNOWN
             return True
 
         def target_may_raise(node):
@@ -431,12 +505,12 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             if isinstance(node, ast.Assert):
                 if not __debug__:
                     return False
-                truth_value = cls._constant_truth_value(node.test)
+                truth_value = constant_truth_value(node.test)
                 return truth_value is not True or expression_may_raise(node.test)
             if isinstance(node, ast.If):
                 if expression_may_raise(node.test):
                     return True
-                truth_value = cls._constant_truth_value(node.test)
+                truth_value = constant_truth_value(node.test)
                 if truth_value is True:
                     return statements_may_raise(node.body)
                 if truth_value is False:
@@ -491,7 +565,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 return {"continue"}
             if isinstance(node, ast.If):
                 visit_expression(node.test)
-                truth_value = cls._constant_truth_value(node.test)
+                truth_value = constant_truth_value(node.test)
                 if truth_value is True:
                     return visit_statements(node.body)
                 if truth_value is False:
@@ -499,7 +573,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 return visit_statements(node.body) | visit_statements(node.orelse)
             if isinstance(node, ast.While):
                 visit_expression(node.test)
-                truth_value = cls._constant_truth_value(node.test)
+                truth_value = constant_truth_value(node.test)
                 if truth_value is False:
                     return visit_statements(node.orelse)
                 body_exits = visit_statements(node.body)
@@ -512,7 +586,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             if isinstance(node, (ast.For, ast.AsyncFor)):
                 visit_expression(node.target)
                 visit_expression(node.iter)
-                iterable = cls._constant_value(node.iter)
+                iterable = constant_value(node.iter)
                 if iterable is not cls._UNKNOWN:
                     try:
                         if len(iterable) == 0:
@@ -559,7 +633,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                     guard_truth = True
                     if case.guard is not None:
                         visit_expression(case.guard)
-                        guard_truth = cls._constant_truth_value(case.guard)
+                        guard_truth = constant_truth_value(case.guard)
                     if guard_truth is False:
                         continue
                     exits |= visit_statements(case.body)
@@ -576,7 +650,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 if not __debug__:
                     return {"fallthrough"}
                 visit_expression(node.test)
-                truth_value = cls._constant_truth_value(node.test)
+                truth_value = constant_truth_value(node.test)
                 if truth_value is not True:
                     visit_expression(node.msg)
                 return {"raise"} if truth_value is False else {"fallthrough", "raise"}
@@ -595,17 +669,20 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         return cls._executable_nodes_in_statements(
             function_node.body,
             shadowed_names=cls._function_local_bindings(function_node),
+            nonraising_names=cls._function_argument_bindings(function_node),
         )
 
-    @staticmethod
-    def _is_direct_self_or_super_receiver(node):
+    @classmethod
+    def _is_direct_self_or_super_receiver(cls, function_node, node):
         return (
             isinstance(node, ast.Name)
             and node.id == "self"
+            and "self" not in cls._function_rebound_names(function_node)
         ) or (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id == "super"
+            and "super" not in cls._function_local_bindings(function_node)
             and not node.args
             and not node.keywords
         )
@@ -655,7 +732,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         return receivers
 
     @staticmethod
-    def _function_local_bindings(function_node):
+    def _function_argument_bindings(function_node):
         bindings = {
             argument.arg
             for argument in [
@@ -668,11 +745,69 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             bindings.add(function_node.args.vararg.arg)
         if function_node.args.kwarg is not None:
             bindings.add(function_node.args.kwarg.arg)
+        return bindings
+
+    @classmethod
+    def _function_local_bindings(cls, function_node):
+        bindings = cls._function_argument_bindings(function_node)
 
         class BindingVisitor(ast.NodeVisitor):
             def visit_Name(self, node):
-                if isinstance(node.ctx, ast.Store):
+                if isinstance(node.ctx, (ast.Store, ast.Del)):
                     bindings.add(node.id)
+
+            def visit_comprehension(self, node):
+                self.visit(node.iter)
+                for condition in node.ifs:
+                    self.visit(condition)
+
+            def visit_AsyncFunctionDef(self, node):
+                bindings.add(node.name)
+
+            def visit_FunctionDef(self, node):
+                bindings.add(node.name)
+
+            def visit_Lambda(self, node):
+                return None
+
+            def visit_ClassDef(self, node):
+                bindings.add(node.name)
+
+            def visit_Import(self, node):
+                bindings.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+
+            def visit_ImportFrom(self, node):
+                bindings.update(alias.asname or alias.name for alias in node.names)
+
+            def visit_ExceptHandler(self, node):
+                if node.name is not None:
+                    bindings.add(node.name)
+                self.generic_visit(node)
+
+            def visit_Global(self, node):
+                bindings.update(node.names)
+
+            def visit_Nonlocal(self, node):
+                bindings.update(node.names)
+
+        visitor = BindingVisitor()
+        for statement in function_node.body:
+            visitor.visit(statement)
+        return bindings
+
+    @classmethod
+    def _function_rebound_names(cls, function_node):
+        bindings = set()
+
+        class BindingVisitor(ast.NodeVisitor):
+            def visit_Name(self, node):
+                if isinstance(node.ctx, (ast.Store, ast.Del)):
+                    bindings.add(node.id)
+
+            def visit_comprehension(self, node):
+                self.visit(node.iter)
+                for condition in node.ifs:
+                    self.visit(condition)
 
             def visit_AsyncFunctionDef(self, node):
                 bindings.add(node.name)
@@ -770,14 +905,14 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 and function.value.id in cls._permitted_websocket_receivers(function_node)
             )
         if function_name == "_on_order_stream_interruption":
-            return cls._is_direct_self_or_super_receiver(function.value)
+            return cls._is_direct_self_or_super_receiver(function_node, function.value)
         if function_name == "start":
             return (
                 isinstance(function.value, ast.Attribute)
                 and function.value.attr == "_data_source"
-                and cls._is_direct_self_or_super_receiver(function.value.value)
+                and cls._is_direct_self_or_super_receiver(function_node, function.value.value)
             )
-        return cls._is_direct_self_or_super_receiver(function.value)
+        return cls._is_direct_self_or_super_receiver(function_node, function.value)
 
     @staticmethod
     def _expected_lifecycle_boundary_names(definition, function_node):
@@ -995,6 +1130,143 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
 
         with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
             self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+    def test_builtin_folding_uses_bindings_from_the_entire_function_scope(self):
+        range_function = ast.parse(
+            "async def listen_for_subscriptions(self, range):\n"
+            "    for _ in range(1):\n"
+            "        await self._on_order_stream_interruption()\n"
+        ).body[0]
+        set_function = ast.parse(
+            "async def listen_for_subscriptions(self):\n"
+            "    for _ in set():\n"
+            "        await self._on_order_stream_interruption()\n"
+            "    set = lambda: {1}\n"
+        ).body[0]
+
+        range_call = range_function.body[0].iter
+        set_call = set_function.body[0].iter
+        self.assertIs(
+            self._UNKNOWN,
+            self._constant_value(range_call, self._function_local_bindings(range_function)),
+        )
+        self.assertIs(
+            self._UNKNOWN,
+            self._constant_value(set_call, self._function_local_bindings(set_function)),
+        )
+
+    def test_static_audit_rejects_shadowed_super_and_rebound_self_receivers(self):
+        sources = (
+            "async def listen_for_subscriptions(self, super):\n"
+            "    await super()._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self, other):\n"
+            "    await self._on_order_stream_interruption()\n"
+            "    self = other\n",
+            "async def listen_for_subscriptions(self):\n"
+            "    await super()._on_order_stream_interruption()\n"
+            "    def super():\n"
+            "        return self\n",
+        )
+
+        for source in sources:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+                    self._audit_definition(
+                        "mutated:Listener.listen_for_subscriptions",
+                        ast.parse(source).body[0],
+                    )
+
+    def test_static_audit_rejects_dominated_boolean_and_nonraising_parameter_handlers(self):
+        cases = (
+            (
+                "async def listen_for_subscriptions(self, flag):\n"
+                "    if flag and False:\n"
+                "        await self._on_order_stream_interruption()\n",
+                ((False,), (True,)),
+            ),
+            (
+                "async def listen_for_subscriptions(self, flag):\n"
+                "    if flag or True:\n"
+                "        return\n"
+                "    await self._on_order_stream_interruption()\n",
+                ((False,), (True,)),
+            ),
+            (
+                "async def listen_for_subscriptions(self, flag):\n"
+                "    try:\n"
+                "        flag\n"
+                "    except Exception:\n"
+                "        await self._on_order_stream_interruption()\n",
+                ((False,), (True,)),
+            ),
+        )
+
+        for source, argument_sets in cases:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+                    self._audit_definition(
+                        "mutated:Listener.listen_for_subscriptions",
+                        ast.parse(source).body[0],
+                    )
+                hits = 0
+
+                class Probe:
+                    async def _on_order_stream_interruption(probe_self):
+                        nonlocal hits
+                        hits += 1
+
+                namespace = {}
+                exec(compile(source, "<binding-runtime-probe>", "exec"), namespace)
+                for arguments in argument_sets:
+                    asyncio.run(namespace["listen_for_subscriptions"](Probe(), *arguments))
+                self.assertEqual(0, hits)
+
+    def test_comprehension_target_binding_precedes_filters_and_result(self):
+        rejected_sources = (
+            "async def listen_for_subscriptions(self):\n"
+            "    [await self._on_order_stream_interruption() for (a, b) in [1]]\n",
+            "async def listen_for_subscriptions(self):\n"
+            "    [await self._on_order_stream_interruption() for (a, b) in [1, (2, 3)]]\n",
+        )
+        accepted_sources = (
+            "async def listen_for_subscriptions(self):\n"
+            "    [await self._on_order_stream_interruption() for (a, b) in [(1, 2), 3]]\n",
+            "async def listen_for_subscriptions(self, values):\n"
+            "    [await self._on_order_stream_interruption() for (a, b) in values]\n",
+        )
+
+        for source in rejected_sources:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+                    self._audit_definition(
+                        "mutated:Listener.listen_for_subscriptions",
+                        ast.parse(source).body[0],
+                    )
+        for source in accepted_sources:
+            with self.subTest(source=source):
+                self._audit_definition(
+                    "mutated:Listener.listen_for_subscriptions",
+                    ast.parse(source).body[0],
+                )
+
+        hits = 0
+
+        class Probe:
+            async def _on_order_stream_interruption(probe_self):
+                nonlocal hits
+                hits += 1
+
+        namespace = {}
+        exec(compile(rejected_sources[0], "<unpack-runtime-probe>", "exec"), namespace)
+        with self.assertRaises(TypeError):
+            asyncio.run(namespace["listen_for_subscriptions"](Probe()))
+        self.assertEqual(0, hits)
+
+        namespace = {}
+        exec(compile(accepted_sources[0], "<sequential-unpack-runtime-probe>", "exec"), namespace)
+        with self.assertRaises(TypeError):
+            asyncio.run(namespace["listen_for_subscriptions"](Probe()))
+        self.assertEqual(1, hits)
 
     def test_static_audit_rejects_false_literal_comparison_and_boolean_operands(self):
         sources = (
@@ -1733,6 +2005,10 @@ class OrderBookTrackerDataSourceListenerTests(IsolatedAsyncioWrapperTestCase):
             listener_task.cancel("test cleanup")
         await asyncio.gather(listener_task, return_exceptions=True)
 
+    def _assert_task_boundary_cancellation(self, cancellation, expected_args):
+        self.assertIs(type(cancellation), asyncio.CancelledError)
+        self.assertEqual(expected_args if sys.version_info >= (3, 11) else (), cancellation.args)
+
     async def test_listener_clears_exact_assistant_after_disconnect_returns(self):
         connection = _ControllableConnection()
         assistant = WSAssistant(connection)
@@ -1742,7 +2018,7 @@ class OrderBookTrackerDataSourceListenerTests(IsolatedAsyncioWrapperTestCase):
         with self.assertRaises(asyncio.CancelledError) as cancellation_context:
             await listener_task
 
-        self.assertEqual(("listener cancelled",), cancellation_context.exception.args)
+        self._assert_task_boundary_cancellation(cancellation_context.exception, ("listener cancelled",))
         self.assertEqual(1, connection.disconnect_calls)
         self.assertIsNone(self.data_source._ws_assistant)
 
@@ -1820,7 +2096,7 @@ class OrderBookTrackerDataSourceListenerTests(IsolatedAsyncioWrapperTestCase):
         with self.assertRaises(asyncio.CancelledError) as cancellation_context:
             await listener_task
 
-        self.assertEqual(("disconnect cancelled",), cancellation_context.exception.args)
+        self._assert_task_boundary_cancellation(cancellation_context.exception, ("disconnect cancelled",))
         self.assertEqual(1, connection.disconnect_calls)
         self.assertIsNone(self.data_source._ws_assistant)
 
@@ -1834,11 +2110,65 @@ class OrderBookTrackerDataSourceListenerTests(IsolatedAsyncioWrapperTestCase):
             with self.assertRaises(asyncio.CancelledError) as cancellation_context:
                 await listener_task
 
-        self.assertEqual(("primary cancellation",), cancellation_context.exception.args)
+        self._assert_task_boundary_cancellation(cancellation_context.exception, ("primary cancellation",))
         self.assertTrue(listener_task.cancelled())
         self.assertEqual(1, connection.disconnect_calls)
         self.assertTrue(any("disconnect failed" in record for record in log_context.output))
         self.assertIsNone(self.data_source._ws_assistant)
+
+    async def test_direct_listener_await_preserves_exact_primary_cancellation_and_args(self):
+        primary_error = asyncio.CancelledError("direct primary", 230)
+        connection = _ControllableConnection(disconnect_error=RuntimeError("disconnect failed"))
+        assistant = WSAssistant(connection)
+        self.data_source.assistants.put_nowait(assistant)
+        self.data_source._process_websocket_messages = AsyncMock(side_effect=primary_error)
+
+        with self.assertLogs(self.data_source.logger(), level="ERROR"):
+            with self.assertRaises(asyncio.CancelledError) as cancellation_context:
+                await self.data_source.listen_for_subscriptions()
+
+        self.assertIs(primary_error, cancellation_context.exception)
+        self.assertEqual(("direct primary", 230), cancellation_context.exception.args)
+        self.assertEqual(1, connection.disconnect_calls)
+        self.assertIsNone(self.data_source._ws_assistant)
+
+    async def test_scheduled_listener_identity_follows_the_cpython_task_substrate(self):
+        for tracker_wrapped in (False, True):
+            with self.subTest(tracker_wrapped=tracker_wrapped):
+                self.data_source = ListenerTestOrderBookTrackerDataSource()
+                primary_error = asyncio.CancelledError("scheduled primary", tracker_wrapped)
+                processing_release = asyncio.Event()
+                connection = _ControllableConnection(disconnect_error=RuntimeError("disconnect failed"))
+                assistant = WSAssistant(connection)
+
+                async def process_messages(*args, **kwargs):
+                    await processing_release.wait()
+                    raise primary_error
+
+                self.data_source._process_websocket_messages = process_messages
+                self.data_source.assistants.put_nowait(assistant)
+                if tracker_wrapped:
+                    tracker = OrderBookTracker(self.data_source, ["BTC-USDT"])
+                    listener_task = tracker._schedule_data_source_task(0, "listen_for_subscriptions")
+                    subscribed = await asyncio.wait_for(self.data_source.subscribed_assistants.get(), timeout=0.2)
+                    self.assertIs(assistant, subscribed)
+                else:
+                    listener_task = await self._start_listener(assistant)
+
+                with self.assertLogs(self.data_source.logger(), level="ERROR"):
+                    processing_release.set()
+                    with self.assertRaises(asyncio.CancelledError) as cancellation_context:
+                        await listener_task
+
+                self.assertIs(type(primary_error), type(cancellation_context.exception))
+                if sys.version_info < (3, 11):
+                    self.assertIsNot(primary_error, cancellation_context.exception)
+                    self.assertEqual((), cancellation_context.exception.args)
+                else:
+                    self.assertIs(primary_error, cancellation_context.exception)
+                    self.assertEqual(("scheduled primary", tracker_wrapped), cancellation_context.exception.args)
+                self.assertEqual(1, connection.disconnect_calls)
+                self.assertIsNone(self.data_source._ws_assistant)
 
     async def test_tracker_task_preserves_primary_cancellation_over_disconnect_failure(self):
         connection = _ControllableConnection(disconnect_error=RuntimeError("disconnect failed"))
@@ -1857,7 +2187,10 @@ class OrderBookTrackerDataSourceListenerTests(IsolatedAsyncioWrapperTestCase):
             with self.assertRaises(asyncio.CancelledError) as cancellation_context:
                 await listener_task
 
-        self.assertEqual(("tracker primary cancellation",), cancellation_context.exception.args)
+        self._assert_task_boundary_cancellation(
+            cancellation_context.exception,
+            ("tracker primary cancellation",),
+        )
         self.assertTrue(listener_task.cancelled())
         self.assertEqual(1, connection.disconnect_calls)
         self.assertTrue(any("disconnect failed" in record for record in log_context.output))

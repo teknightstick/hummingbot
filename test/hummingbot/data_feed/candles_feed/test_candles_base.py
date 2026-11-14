@@ -194,6 +194,39 @@ class TestCandlesBaseInterruption(IsolatedAsyncioWrapperTestCase):
 
         old_websocket.disconnect.assert_awaited_once_with()
 
+    async def test_listener_primary_cancellation_wins_over_interruption_error_or_cancellation(self):
+        cleanup_errors = (
+            RuntimeError("disconnect failed"),
+            asyncio.CancelledError("cleanup cancellation", 230),
+        )
+
+        for cleanup_error in cleanup_errors:
+            with self.subTest(cleanup_error=type(cleanup_error).__name__):
+                websocket_assistant = AsyncMock()
+                websocket_assistant.disconnect.side_effect = cleanup_error
+                primary_error = asyncio.CancelledError("primary cancellation", 230)
+
+                with patch.object(
+                    self.data_feed,
+                    "_connected_websocket_assistant",
+                    new=AsyncMock(return_value=websocket_assistant),
+                ), patch.object(
+                    self.data_feed,
+                    "_subscribe_channels",
+                    new=AsyncMock(),
+                ), patch.object(
+                    self.data_feed,
+                    "_process_websocket_messages",
+                    new=AsyncMock(side_effect=primary_error),
+                ):
+                    with self.assertLogs(self.data_feed.logger(), level="ERROR"):
+                        with self.assertRaises(asyncio.CancelledError) as cancellation_context:
+                            await self.data_feed.listen_for_subscriptions()
+
+                self.assertIs(primary_error, cancellation_context.exception)
+                self.assertEqual(("primary cancellation", 230), cancellation_context.exception.args)
+                websocket_assistant.disconnect.assert_awaited_once_with()
+
     async def test_connected_websocket_assistant_disconnects_partial_connection_on_connect_failure(self):
         websocket_assistant = AsyncMock()
         connect_error = RuntimeError("connect failed")

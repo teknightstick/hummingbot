@@ -1,5 +1,6 @@
 """Unit tests for Evedex Perpetual API Order Book Data Source."""
 import asyncio
+import sys
 import time
 import unittest
 from decimal import Decimal
@@ -80,6 +81,19 @@ class TestEvedexPerpetualAPIOrderBookDataSource(unittest.IsolatedAsyncioTestCase
             ],
             "t": int(time.time() * 1000)
         }
+
+    @staticmethod
+    async def _cancellation_suppressing_ping(started, cancellation_seen, release):
+        started.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+
+    def _assert_task_boundary_cancellation(self, cancellation, expected_args):
+        self.assertIs(type(cancellation), asyncio.CancelledError)
+        self.assertEqual(expected_args if sys.version_info >= (3, 11) else (), cancellation.args)
 
     def _instrument_info_response(self) -> List[Dict]:
         """Mock response for GET /api/market/instrument with metrics."""
@@ -188,6 +202,106 @@ class TestEvedexPerpetualAPIOrderBookDataSource(unittest.IsolatedAsyncioTestCase
         self.data_source._ping_task = ping_task
         await self.data_source._connected_websocket_assistant()
         self.assertTrue(ping_task.cancelled() or ping_task.done())
+        self.assertIsNone(self.data_source._ping_task)
+        self.assertEqual(set(), self.data_source._residual_ping_tasks)
+
+    async def test_interruption_distinguishes_child_ping_cancellation_from_owner_cancellation(self):
+        ping_task = asyncio.create_task(asyncio.sleep(10))
+        self.data_source._ping_task = ping_task
+
+        await self.data_source._on_order_stream_interruption()
+
+        self.assertTrue(ping_task.cancelled())
+        self.assertIsNone(self.data_source._ping_task)
+        self.assertEqual(set(), self.data_source._residual_ping_tasks)
+
+    async def test_both_ping_drains_bound_cleanup_and_preserve_owner_cancellation(self):
+        for drain_name in ("connect", "interrupt"):
+            with self.subTest(drain=drain_name):
+                self.data_source = EvedexPerpetualAPIOrderBookDataSource(
+                    trading_pairs=[self.trading_pair],
+                    connector=self.connector,
+                    api_factory=self.api_factory,
+                    domain=CONSTANTS.DEFAULT_DOMAIN,
+                )
+                started = asyncio.Event()
+                cancellation_seen = asyncio.Event()
+                release = asyncio.Event()
+                ping_task = asyncio.create_task(
+                    self._cancellation_suppressing_ping(started, cancellation_seen, release)
+                )
+                self.data_source._ping_task = ping_task
+                await started.wait()
+                owner_cancellations = []
+
+                async def drain_ping():
+                    try:
+                        if drain_name == "connect":
+                            await self.data_source._connected_websocket_assistant()
+                        else:
+                            await self.data_source._on_order_stream_interruption()
+                    except asyncio.CancelledError as cancellation:
+                        owner_cancellations.append(cancellation)
+                        raise
+
+                try:
+                    with patch.object(type(self.data_source), "_PING_TASK_CLEANUP_TIMEOUT", 0.01):
+                        owner_task = asyncio.create_task(drain_ping())
+                        await cancellation_seen.wait()
+                        owner_task.cancel("owner cancellation")
+                        _, pending = await asyncio.wait({owner_task}, timeout=0.1)
+
+                    self.assertFalse(pending)
+                    with self.assertRaises(asyncio.CancelledError) as cancellation_context:
+                        await owner_task
+                    self.assertEqual(1, len(owner_cancellations))
+                    self.assertEqual(("owner cancellation",), owner_cancellations[0].args)
+                    if sys.version_info < (3, 11):
+                        self.assertIsNot(owner_cancellations[0], cancellation_context.exception)
+                        self.assertEqual((), cancellation_context.exception.args)
+                    else:
+                        self.assertIs(owner_cancellations[0], cancellation_context.exception)
+                    self.assertIs(ping_task, self.data_source._ping_task)
+                    self.assertIn(ping_task, self.data_source._residual_ping_tasks)
+                    if drain_name == "connect":
+                        self.api_factory.get_ws_assistant.assert_not_awaited()
+                finally:
+                    release.set()
+                    await asyncio.gather(ping_task, return_exceptions=True)
+                    await asyncio.sleep(0)
+
+                self.assertIsNone(self.data_source._ping_task)
+                self.assertEqual(set(), self.data_source._residual_ping_tasks)
+
+    async def test_old_ping_completion_cannot_clear_replacement_task(self):
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+        old_ping_task = asyncio.create_task(
+            self._cancellation_suppressing_ping(started, cancellation_seen, release)
+        )
+        self.data_source._ping_task = old_ping_task
+        await started.wait()
+
+        with patch.object(type(self.data_source), "_PING_TASK_CLEANUP_TIMEOUT", 0.01):
+            interruption_task = asyncio.create_task(self.data_source._on_order_stream_interruption())
+            await cancellation_seen.wait()
+            replacement_task = asyncio.create_task(asyncio.sleep(10))
+            self.data_source._ping_task = replacement_task
+            await interruption_task
+
+        try:
+            self.assertIs(replacement_task, self.data_source._ping_task)
+            self.assertIn(old_ping_task, self.data_source._residual_ping_tasks)
+            release.set()
+            await old_ping_task
+            await asyncio.sleep(0)
+            self.assertIs(replacement_task, self.data_source._ping_task)
+            self.assertEqual(set(), self.data_source._residual_ping_tasks)
+        finally:
+            release.set()
+            replacement_task.cancel()
+            await asyncio.gather(old_ping_task, replacement_task, return_exceptions=True)
 
     async def _start_listener_with_disconnect(self, disconnect, expect_installed=True, process=None):
         connection_attempts = 0
@@ -321,7 +435,7 @@ class TestEvedexPerpetualAPIOrderBookDataSource(unittest.IsolatedAsyncioTestCase
         with self.assertRaises(asyncio.CancelledError) as cancellation_context:
             await listener_task
 
-        self.assertEqual(("disconnect cancelled",), cancellation_context.exception.args)
+        self._assert_task_boundary_cancellation(cancellation_context.exception, ("disconnect cancelled",))
         self.assertIsNone(self.data_source._ws_assistant)
 
     async def test_primary_cancellation_wins_over_disconnect_failure(self):
@@ -342,7 +456,7 @@ class TestEvedexPerpetualAPIOrderBookDataSource(unittest.IsolatedAsyncioTestCase
             with self.assertRaises(asyncio.CancelledError) as cancellation_context:
                 await listener_task
 
-        self.assertEqual(("primary cancellation",), cancellation_context.exception.args)
+        self._assert_task_boundary_cancellation(cancellation_context.exception, ("primary cancellation",))
         self.assertTrue(listener_task.cancelled())
         self.assertTrue(any("disconnect failed" in record for record in log_context.output))
         self.assertIsNone(self.data_source._ws_assistant)

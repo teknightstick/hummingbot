@@ -455,12 +455,22 @@ class CandlesBase(NetworkBase):
         """
         while True:
             ws: Optional[WSAssistant] = None
-            try:
+
+            async def listen_on_websocket():
+                nonlocal ws
                 await self._fill_candles_task_owner.wait_until_released()
-                ws: WSAssistant = await self._connected_websocket_assistant()
+                ws = await self._connected_websocket_assistant()
                 self._start_candle_generation(ws)
                 await self._subscribe_channels(ws)
-                await self._process_websocket_messages(websocket_assistant=ws)
+                return await self._process_websocket_messages(websocket_assistant=ws)
+
+            try:
+                await await_primary_then_cleanup(
+                    primary=listen_on_websocket(),
+                    cleanup=lambda: self._on_order_stream_interruption(websocket_assistant=ws),
+                    logger=self.logger(),
+                    cleanup_error_message="Error while interrupting the candle stream",
+                )
             except asyncio.CancelledError:
                 raise
             except ConnectionError as connection_exception:
@@ -470,8 +480,6 @@ class CandlesBase(NetworkBase):
                     "Unexpected error occurred when listening to public klines. Retrying in 1 seconds...",
                 )
                 await self._sleep(1.0)
-            finally:
-                await self._on_order_stream_interruption(websocket_assistant=ws)
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
