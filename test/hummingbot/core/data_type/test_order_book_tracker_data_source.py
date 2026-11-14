@@ -270,6 +270,36 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 if not isinstance(child, ast.stmt):
                     visit_expression(child)
 
+        def visit_pattern(node):
+            add_node(node)
+            if isinstance(node, ast.MatchValue):
+                visit_expression(node.value)
+            elif isinstance(node, ast.MatchSequence):
+                for pattern in node.patterns:
+                    visit_pattern(pattern)
+            elif isinstance(node, ast.MatchMapping):
+                for key in node.keys:
+                    visit_expression(key)
+                for pattern in node.patterns:
+                    visit_pattern(pattern)
+            elif isinstance(node, ast.MatchClass):
+                visit_expression(node.cls)
+                for pattern in (*node.patterns, *node.kwd_patterns):
+                    visit_pattern(pattern)
+            elif isinstance(node, ast.MatchAs):
+                if node.pattern is not None:
+                    visit_pattern(node.pattern)
+            elif isinstance(node, ast.MatchOr):
+                for pattern in node.patterns:
+                    visit_pattern(pattern)
+
+        def is_irrefutable_pattern(node):
+            if isinstance(node, ast.MatchAs):
+                return node.pattern is None or is_irrefutable_pattern(node.pattern)
+            if isinstance(node, ast.MatchOr):
+                return any(is_irrefutable_pattern(pattern) for pattern in node.patterns)
+            return False
+
         def visit_statements(block):
             exits = {"fallthrough"}
             for statement in block:
@@ -350,6 +380,26 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 exits = final_exits - {"fallthrough"}
                 if "fallthrough" in final_exits:
                     exits |= protected_exits
+                return exits
+            if isinstance(node, ast.Match):
+                visit_expression(node.subject)
+                exits = set()
+                exhaustive = False
+                for case in node.cases:
+                    if exhaustive:
+                        break
+                    add_node(case)
+                    visit_pattern(case.pattern)
+                    guard_truth = True
+                    if case.guard is not None:
+                        visit_expression(case.guard)
+                        guard_truth = cls._constant_truth_value(case.guard)
+                    if guard_truth is False:
+                        continue
+                    exits |= visit_statements(case.body)
+                    exhaustive = is_irrefutable_pattern(case.pattern) and guard_truth is True
+                if not exhaustive:
+                    exits.add("fallthrough")
                 return exits
             if isinstance(node, (ast.With, ast.AsyncWith)):
                 for item in node.items:
@@ -850,6 +900,173 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                     "mutated:Listener.listen_for_subscriptions",
                     ast.parse(source).body[0],
                 )
+
+    def test_static_audit_includes_boundaries_in_exhaustive_match_cases(self):
+        function_node = ast.parse(
+            "async def listen_for_subscriptions(self, value):\n"
+            "    match value:\n"
+            "        case 1:\n"
+            "            await self._on_order_stream_interruption()\n"
+            "        case _:\n"
+            "            await self._on_order_stream_interruption()\n"
+        ).body[0]
+
+        match_node = function_node.body[0]
+        executable_nodes = self._executable_body_nodes(function_node)
+        case_awaits = [case.body[0].value for case in match_node.cases]
+
+        self.assertTrue(all(await_node in executable_nodes for await_node in case_awaits))
+        self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+    def test_static_audit_visits_later_match_case_after_earlier_case_terminates(self):
+        function_node = ast.parse(
+            "async def listen_for_subscriptions(self, value):\n"
+            "    match value:\n"
+            "        case 1:\n"
+            "            return\n"
+            "        case _:\n"
+            "            await self._on_order_stream_interruption()\n"
+        ).body[0]
+
+        self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+    def test_static_audit_includes_match_subject_and_guard_expressions(self):
+        sources = (
+            "async def listen_for_subscriptions(self):\n"
+            "    match await self._on_order_stream_interruption():\n"
+            "        case _:\n"
+            "            return\n",
+            "async def listen_for_subscriptions(self, value):\n"
+            "    match value:\n"
+            "        case _ if await self._on_order_stream_interruption():\n"
+            "            return\n",
+        )
+
+        for source in sources:
+            with self.subTest(source=source):
+                self._audit_definition(
+                    "mutated:Listener.listen_for_subscriptions",
+                    ast.parse(source).body[0],
+                )
+
+    def test_static_audit_keeps_following_boundary_after_nonexhaustive_match(self):
+        function_node = ast.parse(
+            "async def listen_for_subscriptions(self, value):\n"
+            "    match value:\n"
+            "        case 1:\n"
+            "            return\n"
+            "    await self._on_order_stream_interruption()\n"
+        ).body[0]
+
+        self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+    def test_static_audit_keeps_following_boundary_when_an_exhaustive_case_falls_through(self):
+        function_node = ast.parse(
+            "async def listen_for_subscriptions(self, value):\n"
+            "    match value:\n"
+            "        case 1:\n"
+            "            return\n"
+            "        case _:\n"
+            "            self._listen_task.cancel()\n"
+            "    await self._on_order_stream_interruption()\n"
+        ).body[0]
+
+        self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+    def test_static_audit_rejects_boundary_after_exhaustive_terminating_match(self):
+        sources = [
+            (
+                pattern,
+                ast.parse(
+                    "async def listen_for_subscriptions(self, value):\n"
+                    "    match value:\n"
+                    f"        case {pattern}:\n"
+                    "            return\n"
+                    "    await self._on_order_stream_interruption()\n"
+                ).body[0],
+            )
+            for pattern in ("_", "captured")
+        ]
+        sources.append(
+            (
+                "multiple terminating cases",
+                ast.parse(
+                    "async def listen_for_subscriptions(self, value):\n"
+                    "    match value:\n"
+                    "        case 1:\n"
+                    "            return\n"
+                    "        case _:\n"
+                    "            raise RuntimeError('stop')\n"
+                    "    await self._on_order_stream_interruption()\n"
+                ).body[0],
+            )
+        )
+
+        for pattern, function_node in sources:
+            with self.subTest(pattern=pattern):
+                with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+                    self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+    def test_static_audit_does_not_treat_refutable_or_guarded_patterns_as_exhaustive(self):
+        sources = (
+            "async def listen_for_subscriptions(self, value):\n"
+            "    match value:\n"
+            "        case 1 | 2:\n"
+            "            return\n"
+            "    await self._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self, value):\n"
+            "    match value:\n"
+            "        case captured if captured:\n"
+            "            return\n"
+            "    await self._on_order_stream_interruption()\n",
+        )
+
+        for source in sources:
+            with self.subTest(source=source):
+                self._audit_definition(
+                    "mutated:Listener.listen_for_subscriptions",
+                    ast.parse(source).body[0],
+                )
+
+    def test_static_audit_rejects_match_boundaries_in_false_guards_and_nested_scopes(self):
+        sources = (
+            "async def listen_for_subscriptions(self, value):\n"
+            "    match value:\n"
+            "        case _ if False:\n"
+            "            await self._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self, value):\n"
+            "    match value:\n"
+            "        case captured:\n"
+            "            async def nested():\n"
+            "                await self._on_order_stream_interruption()\n",
+        )
+
+        for source in sources:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+                    self._audit_definition(
+                        "mutated:Listener.listen_for_subscriptions",
+                        ast.parse(source).body[0],
+                    )
+
+    def test_static_audit_skips_unreachable_match_patterns_guards_and_bodies(self):
+        function_node = ast.parse(
+            "async def listen_for_subscriptions(self, value):\n"
+            "    match value:\n"
+            "        case _:\n"
+            "            return\n"
+            "        case namespace.VALUE if await self._on_order_stream_interruption():\n"
+            "            await self._on_order_stream_interruption()\n"
+        ).body[0]
+        match_node = function_node.body[0]
+        unreachable_case = match_node.cases[1]
+        executable_nodes = self._executable_body_nodes(function_node)
+
+        self.assertNotIn(unreachable_case.pattern, executable_nodes)
+        self.assertNotIn(unreachable_case.guard, executable_nodes)
+        self.assertNotIn(unreachable_case.body[0], executable_nodes)
+        with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+            self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
 
 
 class _ControllableConnection:
