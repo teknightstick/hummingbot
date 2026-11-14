@@ -315,11 +315,13 @@ async def await_primary_then_cleanup(
 
     result = None
     primary_error = None
+    primary_error_args = None
     try:
         if primary is not None:
             result = await primary
     except BaseException as error:
         primary_error = error
+        primary_error_args = error.args
 
     cleanup_cancellation = None
     if cleanup is not None:
@@ -334,6 +336,16 @@ async def await_primary_then_cleanup(
             )
 
     if primary_error is not None:
+        if cleanup_cancellation is not None:
+            logger.error(
+                cleanup_error_message,
+                exc_info=(
+                    type(cleanup_cancellation),
+                    cleanup_cancellation,
+                    cleanup_cancellation.__traceback__,
+                ),
+            )
+        primary_error.args = primary_error_args
         raise primary_error
     if cleanup_cancellation is not None:
         raise cleanup_cancellation

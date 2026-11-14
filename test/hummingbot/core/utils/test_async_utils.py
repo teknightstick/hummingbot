@@ -385,3 +385,55 @@ class GenerationOwnedTaskOwnerTests(IsolatedAsyncioWrapperTestCase):
         self.assertIsNone(owner._current_task)
         self.assertEqual({}, owner._tasks_by_generation)
         self.assertEqual(set(), owner._residual_tasks)
+
+    async def test_primary_cancellation_object_and_args_win_over_cleanup_failure(self):
+        logger = MagicMock()
+        primary_error = asyncio.CancelledError("primary cancellation")
+        cleanup_awaited = False
+
+        async def primary():
+            raise primary_error
+
+        async def cleanup():
+            nonlocal cleanup_awaited
+            await asyncio.sleep(0)
+            cleanup_awaited = True
+            raise RuntimeError("cleanup failed")
+
+        with self.assertRaises(asyncio.CancelledError) as cancellation_context:
+            await await_primary_then_cleanup(
+                primary=primary(),
+                cleanup=cleanup,
+                logger=logger,
+                cleanup_error_message="cleanup failed",
+            )
+
+        self.assertIs(primary_error, cancellation_context.exception)
+        self.assertEqual(("primary cancellation",), cancellation_context.exception.args)
+        self.assertTrue(cleanup_awaited)
+        logger.error.assert_called_once()
+
+    async def test_primary_cancellation_wins_over_secondary_cleanup_cancellation(self):
+        logger = MagicMock()
+        primary_error = asyncio.CancelledError("primary cancellation")
+        cleanup_error = asyncio.CancelledError("cleanup cancellation")
+
+        async def primary():
+            raise primary_error
+
+        async def cleanup():
+            await asyncio.sleep(0)
+            raise cleanup_error
+
+        with self.assertRaises(asyncio.CancelledError) as cancellation_context:
+            await await_primary_then_cleanup(
+                primary=primary(),
+                cleanup=cleanup,
+                logger=logger,
+                cleanup_error_message="cleanup cancelled",
+            )
+
+        self.assertIs(primary_error, cancellation_context.exception)
+        self.assertEqual(("primary cancellation",), cancellation_context.exception.args)
+        logged_error = logger.error.call_args.kwargs["exc_info"][1]
+        self.assertIs(cleanup_error, logged_error)

@@ -76,6 +76,8 @@ EXPECTED_ORDER_STREAM_DEFINITIONS = {
 }
 
 ALTERNATE_LIFECYCLE_BOUNDARIES = {
+    "hummingbot/core/data_type/order_book_tracker_data_source.py:"
+    "OrderBookTrackerDataSource.listen_for_subscriptions": {"await_primary_then_cleanup"},
     "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
     "BybitPerpetualAPIOrderBookDataSource.listen_for_subscriptions": {"tasks_future"},
     "hummingbot/connector/derivative/injective_v2_perpetual/"
@@ -138,16 +140,36 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
 
     @classmethod
     def _constant_value(cls, node):
+        if isinstance(node, ast.Name) and node.id == "__debug__":
+            return __debug__
+        if isinstance(node, ast.UnaryOp):
+            operand = cls._constant_value(node.operand)
+            if operand is cls._UNKNOWN:
+                return cls._UNKNOWN
+            try:
+                if isinstance(node.op, ast.Not):
+                    return not operand
+                if isinstance(node.op, ast.UAdd):
+                    return +operand
+                if isinstance(node.op, ast.USub):
+                    return -operand
+                if isinstance(node.op, ast.Invert):
+                    return ~operand
+            except (TypeError, ValueError, OverflowError):
+                return cls._UNKNOWN
+            return cls._UNKNOWN
         if isinstance(node, ast.BoolOp):
+            result = cls._UNKNOWN
             for value_node in node.values:
                 value = cls._constant_value(value_node)
                 if value is cls._UNKNOWN:
                     return cls._UNKNOWN
                 if isinstance(node.op, ast.And) and not bool(value):
-                    return False
+                    return value
                 if isinstance(node.op, ast.Or) and bool(value):
-                    return True
-            return isinstance(node.op, ast.And)
+                    return value
+                result = value
+            return result
         if isinstance(node, ast.Compare):
             left = cls._constant_value(node.left)
             if left is cls._UNKNOWN:
@@ -221,7 +243,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         return None if value is cls._UNKNOWN else bool(value)
 
     @classmethod
-    def _executable_nodes_in_statements(cls, statements):
+    def _executable_nodes_in_statements(cls, statements, shadowed_names=frozenset()):
         nodes = []
         node_ids = set()
 
@@ -235,6 +257,33 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 return
             add_node(node)
             if isinstance(node, ast.Lambda):
+                for default in (*node.args.defaults, *node.args.kw_defaults):
+                    visit_expression(default)
+                return
+            if isinstance(node, ast.GeneratorExp):
+                if node.generators:
+                    visit_expression(node.generators[0].iter)
+                return
+            if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp)):
+                for generator in node.generators:
+                    visit_expression(generator.iter)
+                    iterable = cls._constant_value(generator.iter)
+                    if iterable is not cls._UNKNOWN:
+                        try:
+                            if len(iterable) == 0:
+                                return
+                        except TypeError:
+                            pass
+                    visit_expression(generator.target)
+                    for condition in generator.ifs:
+                        visit_expression(condition)
+                        if cls._constant_truth_value(condition) is False:
+                            return
+                if isinstance(node, ast.DictComp):
+                    visit_expression(node.key)
+                    visit_expression(node.value)
+                else:
+                    visit_expression(node.elt)
                 return
             if isinstance(node, ast.BoolOp):
                 for value_node in node.values:
@@ -298,6 +347,112 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 return node.pattern is None or is_irrefutable_pattern(node.pattern)
             if isinstance(node, ast.MatchOr):
                 return any(is_irrefutable_pattern(pattern) for pattern in node.patterns)
+            if isinstance(node, ast.MatchClass):
+                return (
+                    isinstance(node.cls, ast.Name)
+                    and node.cls.id == "object"
+                    and "object" not in shadowed_names
+                    and not node.patterns
+                    and not node.kwd_patterns
+                )
+            return False
+
+        def expression_may_raise(node):
+            if node is None or isinstance(node, ast.Constant):
+                return False
+            if isinstance(node, ast.Name):
+                return node.id != "__debug__"
+            if isinstance(node, ast.Lambda):
+                return any(expression_may_raise(default) for default in (*node.args.defaults, *node.args.kw_defaults))
+            if isinstance(node, ast.GeneratorExp):
+                return bool(node.generators) and expression_may_raise(node.generators[0].iter)
+            if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+                return any(expression_may_raise(element) for element in node.elts)
+            if isinstance(node, ast.Dict):
+                return any(expression_may_raise(key) for key in node.keys if key is not None) or any(
+                    expression_may_raise(value) for value in node.values
+                )
+            if isinstance(node, ast.BoolOp):
+                for value_node in node.values:
+                    if expression_may_raise(value_node):
+                        return True
+                    truth_value = cls._constant_truth_value(value_node)
+                    if isinstance(node.op, ast.And) and truth_value is False:
+                        return False
+                    if isinstance(node.op, ast.Or) and truth_value is True:
+                        return False
+                return False
+            if isinstance(node, ast.IfExp):
+                if expression_may_raise(node.test):
+                    return True
+                truth_value = cls._constant_truth_value(node.test)
+                if truth_value is True:
+                    return expression_may_raise(node.body)
+                if truth_value is False:
+                    return expression_may_raise(node.orelse)
+                return True
+            if isinstance(node, ast.Compare):
+                if expression_may_raise(node.left):
+                    return True
+                left = node.left
+                for operator, comparator in zip(node.ops, node.comparators):
+                    if expression_may_raise(comparator):
+                        return True
+                    comparison = ast.Compare(left=left, ops=[operator], comparators=[comparator])
+                    truth_value = cls._constant_truth_value(comparison)
+                    if truth_value is None:
+                        return True
+                    if truth_value is False:
+                        return False
+                    left = comparator
+                return False
+            if isinstance(node, ast.UnaryOp):
+                return expression_may_raise(node.operand) or cls._constant_value(node) is cls._UNKNOWN
+            return True
+
+        def target_may_raise(node):
+            if isinstance(node, ast.Name):
+                return False
+            if isinstance(node, (ast.Tuple, ast.List)):
+                return any(target_may_raise(element) for element in node.elts)
+            return True
+
+        def statement_may_raise(node):
+            if isinstance(node, (ast.Pass, ast.Break, ast.Continue)):
+                return False
+            if isinstance(node, ast.Expr):
+                return expression_may_raise(node.value)
+            if isinstance(node, ast.Return):
+                return expression_may_raise(node.value)
+            if isinstance(node, ast.Assign):
+                return expression_may_raise(node.value) or any(target_may_raise(target) for target in node.targets)
+            if isinstance(node, ast.AnnAssign):
+                return expression_may_raise(node.value) or target_may_raise(node.target)
+            if isinstance(node, ast.Assert):
+                if not __debug__:
+                    return False
+                truth_value = cls._constant_truth_value(node.test)
+                return truth_value is not True or expression_may_raise(node.test)
+            if isinstance(node, ast.If):
+                if expression_may_raise(node.test):
+                    return True
+                truth_value = cls._constant_truth_value(node.test)
+                if truth_value is True:
+                    return statements_may_raise(node.body)
+                if truth_value is False:
+                    return statements_may_raise(node.orelse)
+                return True
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                expressions = [*node.decorator_list, *node.args.defaults, *node.args.kw_defaults]
+                return any(expression_may_raise(expression) for expression in expressions if expression is not None)
+            return True
+
+        def statements_may_raise(block):
+            for statement in block:
+                if statement_may_raise(statement):
+                    return True
+                if isinstance(statement, (ast.Return, ast.Break, ast.Continue)):
+                    return False
             return False
 
         def visit_statements(block):
@@ -311,7 +466,17 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
 
         def visit_statement(node):
             add_node(node)
-            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef, ast.ClassDef)):
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                for decorator in node.decorator_list:
+                    visit_expression(decorator)
+                for default in (*node.args.defaults, *node.args.kw_defaults):
+                    visit_expression(default)
+                return {"fallthrough"}
+            if isinstance(node, ast.ClassDef):
+                for expression in (*node.decorator_list, *node.bases):
+                    visit_expression(expression)
+                for keyword in node.keywords:
+                    visit_expression(keyword.value)
                 return {"fallthrough"}
             if isinstance(node, ast.Return):
                 visit_expression(node.value)
@@ -365,10 +530,11 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             if isinstance(node, ast.Try):
                 body_exits = visit_statements(node.body)
                 protected_exits = body_exits - {"fallthrough"}
-                for handler in node.handlers:
-                    add_node(handler)
-                    visit_expression(handler.type)
-                    protected_exits |= visit_statements(handler.body)
+                if statements_may_raise(node.body):
+                    for handler in node.handlers:
+                        add_node(handler)
+                        visit_expression(handler.type)
+                        protected_exits |= visit_statements(handler.body)
                 if "fallthrough" in body_exits:
                     if node.orelse:
                         protected_exits |= visit_statements(node.orelse)
@@ -406,6 +572,14 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                     visit_expression(item.context_expr)
                     visit_expression(item.optional_vars)
                 return visit_statements(node.body)
+            if isinstance(node, ast.Assert):
+                if not __debug__:
+                    return {"fallthrough"}
+                visit_expression(node.test)
+                truth_value = cls._constant_truth_value(node.test)
+                if truth_value is not True:
+                    visit_expression(node.msg)
+                return {"raise"} if truth_value is False else {"fallthrough", "raise"}
             for child in ast.iter_child_nodes(node):
                 if isinstance(child, ast.stmt):
                     visit_statement(child)
@@ -418,7 +592,10 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
 
     @classmethod
     def _executable_body_nodes(cls, function_node):
-        return cls._executable_nodes_in_statements(function_node.body)
+        return cls._executable_nodes_in_statements(
+            function_node.body,
+            shadowed_names=cls._function_local_bindings(function_node),
+        )
 
     @staticmethod
     def _is_direct_self_or_super_receiver(node):
@@ -519,6 +696,12 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 if node.name is not None:
                     bindings.add(node.name)
                 self.generic_visit(node)
+
+            def visit_Global(self, node):
+                bindings.update(node.names)
+
+            def visit_Nonlocal(self, node):
+                bindings.update(node.names)
 
         visitor = BindingVisitor()
         for statement in function_node.body:
@@ -629,7 +812,10 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "cancel":
             task = node.func.value
             return (
-                isinstance(task, ast.Name)
+                (
+                    isinstance(task, ast.Name)
+                    and ("task" in task.id or task.id.endswith("_future"))
+                )
                 or (
                     isinstance(task, ast.Attribute)
                     and task.attr.endswith(("_task", "_future"))
@@ -1068,6 +1254,278 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
             self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
 
+    def test_constant_evaluator_matches_unary_comparison_boolean_and_debug_semantics(self):
+        cases = {
+            "not True": False,
+            "+2": 2,
+            "-2": -2,
+            "~0": -1,
+            "1 < 2 == 2": True,
+            "0 or 3": 3,
+            "2 and 5": 5,
+            "__debug__": __debug__,
+        }
+
+        for expression, expected in cases.items():
+            with self.subTest(expression=expression):
+                node = ast.parse(expression, mode="eval").body
+                self.assertEqual(expected, self._constant_value(node))
+
+    def test_static_audit_matches_runtime_for_reviewer_adversarial_probes(self):
+        def decorator(function):
+            return function
+        cases = (
+            (
+                "unary short circuit",
+                "async def listen_for_subscriptions(self):\n"
+                "    not True and await self._on_order_stream_interruption()\n",
+                (),
+                True,
+                0,
+            ),
+            (
+                "unary exhaustive guard skips later case",
+                "async def listen_for_subscriptions(self, value):\n"
+                "    match value:\n"
+                "        case _ if not False:\n"
+                "            return\n"
+                "        case _:\n"
+                "            await self._on_order_stream_interruption()\n",
+                (None,),
+                True,
+                0,
+            ),
+            (
+                "unary exhaustive guard skips following statement",
+                "async def listen_for_subscriptions(self, value):\n"
+                "    match value:\n"
+                "        case _ if not False:\n"
+                "            return\n"
+                "    await self._on_order_stream_interruption()\n",
+                (None,),
+                True,
+                0,
+            ),
+            (
+                "constant unary boolean guard",
+                "async def listen_for_subscriptions(self):\n"
+                "    if +1 < 0 or ~0 != -1:\n"
+                "        await self._on_order_stream_interruption()\n",
+                (),
+                True,
+                0,
+            ),
+            (
+                "pass try cannot reach handler",
+                "async def listen_for_subscriptions(self):\n"
+                "    try:\n"
+                "        pass\n"
+                "    except Exception:\n"
+                "        await self._on_order_stream_interruption()\n",
+                (),
+                True,
+                0,
+            ),
+            (
+                "constant try cannot reach handler",
+                "async def listen_for_subscriptions(self):\n"
+                "    try:\n"
+                "        1\n"
+                "    except Exception:\n"
+                "        await self._on_order_stream_interruption()\n",
+                (),
+                True,
+                0,
+            ),
+            (
+                "constant assignment try cannot reach handler",
+                "async def listen_for_subscriptions(self):\n"
+                "    try:\n"
+                "        value = 1\n"
+                "    except Exception:\n"
+                "        await self._on_order_stream_interruption()\n",
+                (),
+                True,
+                0,
+            ),
+            (
+                "return try cannot reach handler",
+                "async def listen_for_subscriptions(self):\n"
+                "    try:\n"
+                "        return\n"
+                "    except Exception:\n"
+                "        await self._on_order_stream_interruption()\n",
+                (),
+                True,
+                0,
+            ),
+            (
+                "generator body is lazy",
+                "async def listen_for_subscriptions(self):\n"
+                "    (await self._on_order_stream_interruption() for _ in (1,))\n",
+                (),
+                True,
+                0,
+            ),
+            (
+                "generator filter is lazy",
+                "async def listen_for_subscriptions(self):\n"
+                "    (_ for _ in (1,) if await self._on_order_stream_interruption())\n",
+                (),
+                True,
+                0,
+            ),
+            (
+                "empty eager comprehension skips body",
+                "async def listen_for_subscriptions(self):\n"
+                "    [await self._on_order_stream_interruption() for _ in ()]\n",
+                (),
+                True,
+                0,
+            ),
+            (
+                "nested async definition default is eager",
+                "async def listen_for_subscriptions(self):\n"
+                "    async def nested(value=await self._on_order_stream_interruption()):\n"
+                "        return value\n",
+                (),
+                True,
+                1,
+            ),
+            (
+                "lambda default is eager",
+                "async def listen_for_subscriptions(self):\n"
+                "    lambda value=await self._on_order_stream_interruption(): value\n",
+                (),
+                True,
+                1,
+            ),
+            (
+                "nested definition decorator is eager",
+                "async def listen_for_subscriptions(self):\n"
+                "    @await self._on_order_stream_interruption()\n"
+                "    async def nested():\n"
+                "        return None\n",
+                (),
+                decorator,
+                1,
+            ),
+            (
+                "builtin object class pattern is exhaustive",
+                "async def listen_for_subscriptions(self, value):\n"
+                "    match value:\n"
+                "        case object():\n"
+                "            return\n"
+                "        case _:\n"
+                "            await self._on_order_stream_interruption()\n",
+                (None,),
+                True,
+                0,
+            ),
+            (
+                "shadowed object class pattern stays refutable",
+                "async def listen_for_subscriptions(self, value, object):\n"
+                "    match value:\n"
+                "        case object():\n"
+                "            return\n"
+                "        case _:\n"
+                "            await self._on_order_stream_interruption()\n",
+                (None, str),
+                True,
+                1,
+            ),
+            (
+                "assert follows optimization mode",
+                "async def listen_for_subscriptions(self):\n"
+                "    assert await self._on_order_stream_interruption()\n",
+                (),
+                True,
+                1 if __debug__ else 0,
+            ),
+            (
+                "debug branch follows optimization mode",
+                "async def listen_for_subscriptions(self):\n"
+                "    if __debug__:\n"
+                "        await self._on_order_stream_interruption()\n",
+                (),
+                True,
+                1 if __debug__ else 0,
+            ),
+        )
+
+        for name, source, arguments, boundary_result, expected_hits in cases:
+            with self.subTest(name=name):
+                function_node = ast.parse(source).body[0]
+                if expected_hits:
+                    self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+                else:
+                    with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+                        self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+                hits = 0
+
+                class Probe:
+                    async def _on_order_stream_interruption(probe_self):
+                        nonlocal hits
+                        hits += 1
+                        return boundary_result
+
+                namespace = {}
+                exec(compile(source, "<audit-runtime-probe>", "exec"), namespace)
+                asyncio.run(namespace["listen_for_subscriptions"](Probe(), *arguments))
+                self.assertEqual(expected_hits, hits)
+
+    def test_generator_outer_iterable_expression_is_eager(self):
+        source = (
+            "async def listen_for_subscriptions(self):\n"
+            "    (_ for _ in await self._on_order_stream_interruption())\n"
+        )
+        function_node = ast.parse(source).body[0]
+        self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+        hits = 0
+
+        class Probe:
+            async def _on_order_stream_interruption(probe_self):
+                nonlocal hits
+                hits += 1
+                return ()
+
+        namespace = {}
+        exec(compile(source, "<generator-outer-runtime-probe>", "exec"), namespace)
+        asyncio.run(namespace["listen_for_subscriptions"](Probe()))
+        self.assertEqual(1, hits)
+
+    def test_builtin_object_pattern_is_runtime_exhaustive_for_reviewer_subjects(self):
+        source = (
+            "async def listen_for_subscriptions(self, value):\n"
+            "    match value:\n"
+            "        case object():\n"
+            "            return\n"
+            "        case _:\n"
+            "            await self._on_order_stream_interruption()\n"
+        )
+        function_node = ast.parse(source).body[0]
+        with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+            self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+        hits = 0
+
+        class Probe:
+            async def _on_order_stream_interruption(probe_self):
+                nonlocal hits
+                hits += 1
+
+        namespace = {}
+        exec(compile(source, "<builtin-object-runtime-probe>", "exec"), namespace)
+
+        async def run_subjects():
+            for subject in (None, 1, "value", [], object()):
+                await namespace["listen_for_subscriptions"](Probe(), subject)
+
+        asyncio.run(run_subjects())
+        self.assertEqual(0, hits)
+
 
 class _ControllableConnection:
     def __init__(
@@ -1288,19 +1746,25 @@ class OrderBookTrackerDataSourceListenerTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(1, connection.disconnect_calls)
         self.assertIsNone(self.data_source._ws_assistant)
 
-    async def test_listener_clears_exact_assistant_when_disconnect_raises(self):
+    async def test_listener_logs_disconnect_error_clears_exact_assistant_and_retries(self):
         connection = _ControllableConnection(disconnect_error=RuntimeError("disconnect failed"))
         assistant = WSAssistant(connection)
         listener_task = await self._start_listener(assistant)
-        connection.incoming_messages.put_nowait(_END_OF_STREAM)
 
-        with self.assertRaisesRegex(RuntimeError, "disconnect failed"):
-            await listener_task
+        with self.assertLogs(self.data_source.logger(), level="ERROR") as log_context:
+            connection.incoming_messages.put_nowait(_END_OF_STREAM)
+            for _ in range(20):
+                if connection.disconnect_calls == 1 and self.data_source._ws_assistant is None:
+                    break
+                await asyncio.sleep(0)
 
         self.assertEqual(1, connection.disconnect_calls)
+        self.assertFalse(listener_task.done())
+        self.assertTrue(any("disconnect failed" in record for record in log_context.output))
         self.assertIsNone(self.data_source._ws_assistant)
+        await self._cancel_listener(listener_task)
 
-    async def test_tracker_data_source_loop_sanitizes_disconnect_error_after_clear(self):
+    async def test_tracker_data_source_loop_keeps_running_after_logged_disconnect_error(self):
         connection = _ControllableConnection(disconnect_error=RuntimeError("disconnect failed"))
         assistant = WSAssistant(connection)
         self.data_source.assistants.put_nowait(assistant)
@@ -1311,14 +1775,18 @@ class OrderBookTrackerDataSourceListenerTests(IsolatedAsyncioWrapperTestCase):
             timeout=0.2,
         )
         self.assertIs(assistant, subscribed_assistant)
-        connection.incoming_messages.put_nowait(_END_OF_STREAM)
+        with self.assertLogs(self.data_source.logger(), level="ERROR") as log_context:
+            connection.incoming_messages.put_nowait(_END_OF_STREAM)
+            for _ in range(20):
+                if connection.disconnect_calls == 1 and self.data_source._ws_assistant is None:
+                    break
+                await asyncio.sleep(0)
 
-        with self.assertLogs(OrderBookTracker.logger(), level="ERROR") as log_context:
-            result = await listener_task
-
-        self.assertIsNone(result)
+        self.assertFalse(listener_task.done())
         self.assertTrue(any("disconnect failed" in record for record in log_context.output))
         self.assertIsNone(self.data_source._ws_assistant)
+        listener_task.cancel("tracker cleanup")
+        await asyncio.gather(listener_task, return_exceptions=True)
 
     async def test_listener_keeps_exact_assistant_until_blocked_disconnect_returns(self):
         disconnect_release = asyncio.Event()
@@ -1354,6 +1822,45 @@ class OrderBookTrackerDataSourceListenerTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(("disconnect cancelled",), cancellation_context.exception.args)
         self.assertEqual(1, connection.disconnect_calls)
+        self.assertIsNone(self.data_source._ws_assistant)
+
+    async def test_listener_primary_cancellation_wins_over_disconnect_failure(self):
+        connection = _ControllableConnection(disconnect_error=RuntimeError("disconnect failed"))
+        assistant = WSAssistant(connection)
+        listener_task = await self._start_listener(assistant)
+
+        with self.assertLogs(self.data_source.logger(), level="ERROR") as log_context:
+            listener_task.cancel("primary cancellation")
+            with self.assertRaises(asyncio.CancelledError) as cancellation_context:
+                await listener_task
+
+        self.assertEqual(("primary cancellation",), cancellation_context.exception.args)
+        self.assertTrue(listener_task.cancelled())
+        self.assertEqual(1, connection.disconnect_calls)
+        self.assertTrue(any("disconnect failed" in record for record in log_context.output))
+        self.assertIsNone(self.data_source._ws_assistant)
+
+    async def test_tracker_task_preserves_primary_cancellation_over_disconnect_failure(self):
+        connection = _ControllableConnection(disconnect_error=RuntimeError("disconnect failed"))
+        assistant = WSAssistant(connection)
+        self.data_source.assistants.put_nowait(assistant)
+        tracker = OrderBookTracker(self.data_source, ["BTC-USDT"])
+        listener_task = tracker._schedule_data_source_task(0, "listen_for_subscriptions")
+        subscribed_assistant = await asyncio.wait_for(
+            self.data_source.subscribed_assistants.get(),
+            timeout=0.2,
+        )
+        self.assertIs(assistant, subscribed_assistant)
+
+        with self.assertLogs(self.data_source.logger(), level="ERROR") as log_context:
+            listener_task.cancel("tracker primary cancellation")
+            with self.assertRaises(asyncio.CancelledError) as cancellation_context:
+                await listener_task
+
+        self.assertEqual(("tracker primary cancellation",), cancellation_context.exception.args)
+        self.assertTrue(listener_task.cancelled())
+        self.assertEqual(1, connection.disconnect_calls)
+        self.assertTrue(any("disconnect failed" in record for record in log_context.output))
         self.assertIsNone(self.data_source._ws_assistant)
 
     async def test_old_listener_finishing_cannot_clear_replacement_assistant(self):
@@ -1392,29 +1899,38 @@ class OrderBookTrackerDataSourceListenerTests(IsolatedAsyncioWrapperTestCase):
         replacement_assistant = WSAssistant(replacement_connection)
         replacement_listener_task = await self._start_listener(replacement_assistant)
 
-        disconnect_release.set()
-        with self.assertRaisesRegex(RuntimeError, "old disconnect failed"):
-            await old_listener_task
+        with self.assertLogs(self.data_source.logger(), level="ERROR") as log_context:
+            disconnect_release.set()
+            for _ in range(20):
+                if old_connection.disconnect_calls == 1:
+                    await asyncio.sleep(0)
+                    break
+                await asyncio.sleep(0)
+        self.assertTrue(any("old disconnect failed" in record for record in log_context.output))
         self.assertIs(replacement_assistant, self.data_source._ws_assistant)
 
+        await self._cancel_listener(old_listener_task)
         await self._cancel_listener(replacement_listener_task)
         self.assertIsNone(self.data_source._ws_assistant)
 
     async def test_reconnect_uses_fresh_assistant_and_ignores_stale_frames(self):
         old_connection = _ControllableConnection(disconnect_error=RuntimeError("disconnect failed"))
         old_assistant = WSAssistant(old_connection)
-        old_listener_task = await self._start_listener(old_assistant)
-        old_connection.incoming_messages.put_nowait(_END_OF_STREAM)
+        fresh_connection = _ControllableConnection()
+        fresh_assistant = WSAssistant(fresh_connection)
+        listener_task = await self._start_listener(old_assistant)
+        self.data_source.assistants.put_nowait(fresh_assistant)
 
-        with self.assertRaisesRegex(RuntimeError, "disconnect failed"):
-            await old_listener_task
-        self.assertIsNone(self.data_source._ws_assistant)
+        with self.assertLogs(self.data_source.logger(), level="ERROR"):
+            old_connection.incoming_messages.put_nowait(_END_OF_STREAM)
+            subscribed_assistant = await asyncio.wait_for(
+                self.data_source.subscribed_assistants.get(),
+                timeout=0.2,
+            )
+        self.assertIs(fresh_assistant, subscribed_assistant)
 
         stale_frame = {"channel": self.data_source._trade_messages_queue_key, "session": "stale"}
         old_connection.incoming_messages.put_nowait(stale_frame)
-        fresh_connection = _ControllableConnection()
-        fresh_assistant = WSAssistant(fresh_connection)
-        fresh_listener_task = await self._start_listener(fresh_assistant)
         fresh_frame = {"channel": self.data_source._trade_messages_queue_key, "session": "fresh"}
         fresh_connection.incoming_messages.put_nowait(fresh_frame)
 
@@ -1424,7 +1940,7 @@ class OrderBookTrackerDataSourceListenerTests(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(message_queue.empty())
         self.assertEqual([old_assistant, fresh_assistant], self.data_source.connected_assistants)
 
-        await self._cancel_listener(fresh_listener_task)
+        await self._cancel_listener(listener_task)
         self.assertIsNone(self.data_source._ws_assistant)
 
     async def test_failed_reconnect_does_not_disconnect_previous_assistant_twice(self):
@@ -1441,7 +1957,8 @@ class OrderBookTrackerDataSourceListenerTests(IsolatedAsyncioWrapperTestCase):
             "_sleep",
             new=AsyncMock(side_effect=asyncio.CancelledError("stop retry")),
         ):
-            with self.assertRaises(asyncio.CancelledError):
+            with self.assertRaises(asyncio.CancelledError) as cancellation_context:
                 await self.data_source.listen_for_subscriptions()
 
+        self.assertEqual(("stop retry",), cancellation_context.exception.args)
         self.assertEqual(1, connection.disconnect_calls)

@@ -189,7 +189,7 @@ class TestEvedexPerpetualAPIOrderBookDataSource(unittest.IsolatedAsyncioTestCase
         await self.data_source._connected_websocket_assistant()
         self.assertTrue(ping_task.cancelled() or ping_task.done())
 
-    async def _start_listener_with_disconnect(self, disconnect, expect_installed=True):
+    async def _start_listener_with_disconnect(self, disconnect, expect_installed=True, process=None):
         connection_attempts = 0
 
         async def connected_websocket_assistant():
@@ -202,7 +202,7 @@ class TestEvedexPerpetualAPIOrderBookDataSource(unittest.IsolatedAsyncioTestCase
         self.ws_assistant.disconnect.side_effect = disconnect
         self.data_source._connected_websocket_assistant = connected_websocket_assistant
         self.data_source._subscribe_channels = AsyncMock()
-        self.data_source._process_websocket_messages = AsyncMock()
+        self.data_source._process_websocket_messages = AsyncMock(side_effect=process)
         listener_task = asyncio.create_task(self.data_source.listen_for_subscriptions())
         if expect_installed:
             for _ in range(20):
@@ -288,16 +288,24 @@ class TestEvedexPerpetualAPIOrderBookDataSource(unittest.IsolatedAsyncioTestCase
         await asyncio.gather(listener_task, return_exceptions=True)
         self.assertIs(replacement_assistant, self.data_source._ws_assistant)
 
-    async def test_interruption_disconnect_error_clears_exact_assistant(self):
+    async def test_interruption_disconnect_error_is_logged_and_listener_retries(self):
         async def disconnect():
             raise RuntimeError("disconnect failed")
 
         listener_task = await self._start_listener_with_disconnect(disconnect, expect_installed=False)
 
-        with self.assertRaisesRegex(RuntimeError, "disconnect failed"):
-            await listener_task
+        with self.assertLogs(self.data_source.logger(), level="ERROR") as log_context:
+            for _ in range(20):
+                if self.ws_assistant.disconnect.await_count == 1:
+                    await asyncio.sleep(0)
+                    break
+                await asyncio.sleep(0)
 
+        self.assertFalse(listener_task.done())
+        self.assertTrue(any("disconnect failed" in record for record in log_context.output))
         self.assertIsNone(self.data_source._ws_assistant)
+        listener_task.cancel("test cleanup")
+        await asyncio.gather(listener_task, return_exceptions=True)
 
     async def test_interruption_disconnect_cancellation_preserves_args_and_clears_exact_assistant(self):
         disconnect_started = asyncio.Event()
@@ -314,6 +322,29 @@ class TestEvedexPerpetualAPIOrderBookDataSource(unittest.IsolatedAsyncioTestCase
             await listener_task
 
         self.assertEqual(("disconnect cancelled",), cancellation_context.exception.args)
+        self.assertIsNone(self.data_source._ws_assistant)
+
+    async def test_primary_cancellation_wins_over_disconnect_failure(self):
+        processing_started = asyncio.Event()
+
+        async def process(*args, **kwargs):
+            processing_started.set()
+            await asyncio.Future()
+
+        async def disconnect():
+            raise RuntimeError("disconnect failed")
+
+        listener_task = await self._start_listener_with_disconnect(disconnect, process=process)
+        await asyncio.wait_for(processing_started.wait(), timeout=0.2)
+
+        with self.assertLogs(self.data_source.logger(), level="ERROR") as log_context:
+            listener_task.cancel("primary cancellation")
+            with self.assertRaises(asyncio.CancelledError) as cancellation_context:
+                await listener_task
+
+        self.assertEqual(("primary cancellation",), cancellation_context.exception.args)
+        self.assertTrue(listener_task.cancelled())
+        self.assertTrue(any("disconnect failed" in record for record in log_context.output))
         self.assertIsNone(self.data_source._ws_assistant)
 
     async def test_ping_loop_sends_and_cancels(self):
