@@ -23,6 +23,11 @@ class _WeakrefableWebsocket:
         return None
 
 
+class _ImmediateDoneCallbackTask(asyncio.Task):
+    def add_done_callback(self, callback, *args, **kwargs):
+        callback(self)
+
+
 class _InterruptionTestCandles(CandlesBase):
     @property
     def wss_url(self):
@@ -76,6 +81,22 @@ class TestCandlesBaseInterruption(IsolatedAsyncioWrapperTestCase):
     def _bind_fill_task(self, websocket_assistant, fill_task):
         self.data_feed._start_candle_generation(websocket_assistant)
         self.data_feed._create_fill_candles_task(websocket_assistant, lambda: fill_task)
+
+    async def test_fill_alias_stays_clear_when_done_callback_runs_synchronously(self):
+        websocket_assistant = AsyncMock()
+        fill_task = _ImmediateDoneCallbackTask(
+            asyncio.sleep(0),
+            loop=asyncio.get_running_loop(),
+        )
+        while not fill_task.done():
+            await asyncio.sleep(0)
+
+        returned_task = self.data_feed._create_fill_candles_task(websocket_assistant, lambda: fill_task)
+
+        self.assertIs(fill_task, returned_task)
+        self.assertIsNone(self.data_feed._fill_candles_task)
+        self.assertIsNone(self.data_feed._fill_candles_task_owner.task_for(websocket_assistant))
+        self.data_feed._fill_candles_task_owner.end_generation(websocket_assistant)
 
     async def test_stop_start_waits_for_full_generation_teardown_and_resets_state(self):
         old_websocket = AsyncMock()

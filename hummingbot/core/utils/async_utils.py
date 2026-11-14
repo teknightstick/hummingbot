@@ -128,7 +128,7 @@ class GenerationOwnedTaskOwner:
             else:
                 self._generation_released.clear()
             if isinstance(task, asyncio.Task):
-                self._cancel_and_retrieve_unpublished_task(task)
+                self._retain_failed_creation_task(generation, task)
             elif inspect.iscoroutine(task):
                 task.close()
             raise
@@ -136,32 +136,29 @@ class GenerationOwnedTaskOwner:
             self._task_creation_in_progress = False
             self._task_creation_reentered = False
 
-    def _cancel_and_retrieve_unpublished_task(self, task: asyncio.Task):
+    def _retain_failed_creation_task(self, generation: object, task: asyncio.Task):
         if not task.done():
             task.cancel()
+
+        generation_id = id(generation)
+        self._tasks_by_generation[generation_id] = (generation, task)
+        self._current_generation = generation
+        self._current_task = None
+        self._residual_tasks.add(task)
+        self._end_requested_generation_ids.add(generation_id)
+        self._generation_released.clear()
         try:
-            asyncio.Task.add_done_callback(task, self._retrieve_unpublished_task_result)
+            asyncio.Task.add_done_callback(task, self._task_done)
         except BaseException as callback_error:
             if task.done():
-                self._retrieve_unpublished_task_result(task)
+                self._finalize_task(task)
             else:
                 self._logger.error(
-                    "Could not install cleanup for an unpublished generation-owned task",
+                    "Could not install cleanup for a failed generation-owned task",
                     exc_info=(type(callback_error), callback_error, callback_error.__traceback__),
                 )
-
-    def _retrieve_unpublished_task_result(self, task: asyncio.Task):
-        if task.cancelled():
-            return
-        try:
-            exception = task.exception()
-        except asyncio.CancelledError:
-            return
-        if exception is not None:
-            self._logger.error(
-                self._cleanup_error_message,
-                exc_info=(type(exception), exception, exception.__traceback__),
-            )
+        if task.done():
+            self._finalize_task(task)
 
     def task_for(self, generation: object) -> Optional[asyncio.Task]:
         entry = self._tasks_by_generation.get(id(generation))
@@ -188,7 +185,7 @@ class GenerationOwnedTaskOwner:
         while True:
             live_task = self._live_task()
             if live_task is not None:
-                await asyncio.wait({live_task})
+                await self._wait_for_task_completion(live_task)
                 self._finalize_task(live_task)
                 continue
             if self._current_generation is None:
@@ -207,7 +204,7 @@ class GenerationOwnedTaskOwner:
             if remaining <= 0:
                 break
             try:
-                await asyncio.wait({task}, timeout=remaining)
+                await self._wait_for_task_completion(task, timeout=remaining)
             except asyncio.CancelledError as cancellation:
                 if owner_cancellation is None:
                     owner_cancellation = cancellation
@@ -224,6 +221,29 @@ class GenerationOwnedTaskOwner:
 
         if owner_cancellation is not None:
             raise owner_cancellation
+
+    @staticmethod
+    async def _wait_for_task_completion(task: asyncio.Task, timeout: Optional[float] = None):
+        if task.done():
+            return
+
+        completion = asyncio.get_running_loop().create_future()
+
+        def mark_complete(_):
+            if not completion.done():
+                completion.set_result(None)
+
+        asyncio.Task.add_done_callback(task, mark_complete)
+        try:
+            if timeout is None:
+                await completion
+            else:
+                try:
+                    await asyncio.wait_for(completion, timeout=timeout)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            asyncio.Task.remove_done_callback(task, mark_complete)
 
     def _live_task(self) -> Optional[asyncio.Task]:
         self._prune_finished_tasks()

@@ -29,6 +29,11 @@ class _WeakrefableWebsocket:
         return None
 
 
+class _ImmediateDoneCallbackTask(asyncio.Task):
+    def add_done_callback(self, callback, *args, **kwargs):
+        callback(self)
+
+
 class PacificaPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
     level = 0
 
@@ -80,10 +85,25 @@ class PacificaPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCas
         await self.mocking_assistant.async_init()
 
     def tearDown(self):
+        self.data_source.logger().removeHandler(self)
+        self.assertNotIn(self, self.data_source.logger().handlers)
         self.run_async_with_timeout(self.client_session.close())
         for task in self.async_tasks:
             task.cancel()
         super().tearDown()
+
+    @classmethod
+    def tearDownClass(cls):
+        retained_fixtures = [
+            handler
+            for handler in PacificaPerpetualAPIOrderBookDataSource.logger().handlers
+            if isinstance(handler, cls)
+        ]
+        try:
+            if retained_fixtures:
+                raise AssertionError(f"Pacifica logger retained {len(retained_fixtures)} test fixtures")
+        finally:
+            super().tearDownClass()
 
     def handle(self, record):
         self.log_records.append(record)
@@ -124,6 +144,36 @@ class PacificaPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCas
 
     def _bind_ping_task(self, websocket_assistant, ping_task):
         self.data_source._create_ping_task(websocket_assistant, lambda: ping_task)
+
+    async def test_ping_alias_stays_clear_when_done_callback_runs_synchronously(self):
+        websocket_assistant = AsyncMock()
+        ping_task = _ImmediateDoneCallbackTask(
+            asyncio.sleep(0),
+            loop=asyncio.get_running_loop(),
+        )
+        while not ping_task.done():
+            await asyncio.sleep(0)
+
+        returned_task = self.data_source._create_ping_task(websocket_assistant, lambda: ping_task)
+
+        self.assertIs(ping_task, returned_task)
+        self.assertIsNone(self.data_source._ping_task)
+        self.assertIsNone(self.data_source._ping_task_owner.task_for(websocket_assistant))
+        self.data_source._ping_task_owner.end_generation(websocket_assistant)
+
+    async def test_post_connect_ping_publication_failure_disconnects_exact_websocket_and_preserves_error(self):
+        websocket_assistant = AsyncMock()
+        self.api_factory.get_ws_assistant.return_value = websocket_assistant
+        publication_error = ValueError("ping publication failed")
+        websocket_assistant.disconnect.side_effect = RuntimeError("secondary disconnect failed")
+
+        with patch.object(self.data_source, "_create_ping_task", side_effect=publication_error):
+            with self.assertRaises(ValueError) as context:
+                await self.data_source._connected_websocket_assistant()
+
+        self.assertIs(publication_error, context.exception)
+        websocket_assistant.connect.assert_awaited_once()
+        websocket_assistant.disconnect.assert_awaited_once_with()
 
     async def test_residual_ping_gates_reconnect_and_repeated_cleanup_is_bounded(self):
         old_websocket = AsyncMock()

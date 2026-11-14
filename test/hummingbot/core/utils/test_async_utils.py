@@ -28,6 +28,11 @@ class _CallbackRegistrationFailingTask(asyncio.Task):
         raise RuntimeError("callback registration failed")
 
 
+class _CallbackRegistrationFailingExceptionCountingTask(_ExceptionCountingTask):
+    def add_done_callback(self, callback, *args, **kwargs):
+        raise RuntimeError("callback registration failed")
+
+
 class GenerationOwnedTaskOwnerTests(IsolatedAsyncioWrapperTestCase):
     @staticmethod
     async def _cancellation_suppressing_task(started, cancellation_seen, release):
@@ -81,12 +86,60 @@ class GenerationOwnedTaskOwnerTests(IsolatedAsyncioWrapperTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "callback registration failed"):
             owner.create_task(generation, lambda: task)
-        await asyncio.sleep(0)
+        await owner.wait_until_released()
 
         self.assertTrue(task.cancelled())
         self.assertIsNone(owner._current_generation)
         self.assertIsNone(owner._current_task)
         self.assertEqual({}, owner._tasks_by_generation)
+
+    async def test_callback_registration_failure_retains_cancellation_suppressor_until_terminal(self):
+        logger = MagicMock()
+        owner = self._owner(logger, MagicMock())
+        generation = _Generation()
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fail_after_cancellation():
+            await self._cancellation_suppressing_task(started, cancellation_seen, release)
+            raise ValueError("failed task terminal error")
+
+        task = _CallbackRegistrationFailingExceptionCountingTask(
+            fail_after_cancellation(),
+            loop=asyncio.get_running_loop(),
+        )
+        await started.wait()
+
+        with self.assertRaisesRegex(RuntimeError, "callback registration failed"):
+            owner.create_task(generation, lambda: task)
+        await cancellation_seen.wait()
+
+        waiter = asyncio.create_task(owner.wait_until_released())
+        await asyncio.sleep(0)
+        self.assertFalse(waiter.done())
+        self.assertIs(generation, owner._current_generation)
+        self.assertIs(task, owner.task_for(generation))
+        self.assertIsNone(owner._current_task)
+        self.assertEqual({task}, owner._residual_tasks)
+
+        owner_ref = weakref.ref(owner)
+        owner = None
+        gc.collect()
+        self.assertIsNotNone(owner_ref())
+
+        release.set()
+        await waiter
+        with self.assertRaisesRegex(ValueError, "failed task terminal error"):
+            task.result()
+        await asyncio.sleep(0)
+
+        self.assertEqual(1, task.exception_calls)
+        logger.error.assert_called_once()
+        for _ in range(3):
+            gc.collect()
+            await asyncio.sleep(0)
+        self.assertIsNone(owner_ref())
 
     async def test_create_task_rejects_reentrant_factory_without_inner_or_outer_orphan(self):
         owner = self._owner(MagicMock(), MagicMock())
@@ -110,7 +163,7 @@ class GenerationOwnedTaskOwnerTests(IsolatedAsyncioWrapperTestCase):
         try:
             with self.assertRaisesRegex(RuntimeError, "Reentrant task creation"):
                 owner.create_task(generation, outer_factory)
-            await asyncio.sleep(0)
+            await owner.wait_until_released()
 
             self.assertEqual(1, len(created_tasks))
             self.assertTrue(created_tasks[0].cancelled())

@@ -99,6 +99,8 @@ ALTERNATE_LIFECYCLE_BOUNDARIES = {
 
 
 class OrderStreamOverrideStaticTests(unittest.TestCase):
+    _UNKNOWN = object()
+
     @staticmethod
     def _production_definitions():
         repository_root = Path(__file__).resolve().parents[4]
@@ -134,69 +136,234 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 return target.attr
         return None
 
-    @staticmethod
-    def _constant_truth_value(node):
-        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-            operand_value = OrderStreamOverrideStaticTests._constant_truth_value(node.operand)
-            return None if operand_value is None else not operand_value
+    @classmethod
+    def _constant_value(cls, node):
+        if isinstance(node, ast.BoolOp):
+            for value_node in node.values:
+                value = cls._constant_value(value_node)
+                if value is cls._UNKNOWN:
+                    return cls._UNKNOWN
+                if isinstance(node.op, ast.And) and not bool(value):
+                    return False
+                if isinstance(node.op, ast.Or) and bool(value):
+                    return True
+            return isinstance(node.op, ast.And)
+        if isinstance(node, ast.Compare):
+            left = cls._constant_value(node.left)
+            if left is cls._UNKNOWN:
+                return cls._UNKNOWN
+            for operator, comparator_node in zip(node.ops, node.comparators):
+                right = cls._constant_value(comparator_node)
+                if right is cls._UNKNOWN:
+                    return cls._UNKNOWN
+                try:
+                    if isinstance(operator, ast.Eq):
+                        comparison = left == right
+                    elif isinstance(operator, ast.NotEq):
+                        comparison = left != right
+                    elif isinstance(operator, ast.Lt):
+                        comparison = left < right
+                    elif isinstance(operator, ast.LtE):
+                        comparison = left <= right
+                    elif isinstance(operator, ast.Gt):
+                        comparison = left > right
+                    elif isinstance(operator, ast.GtE):
+                        comparison = left >= right
+                    elif isinstance(operator, ast.Is):
+                        comparison = left is right
+                    elif isinstance(operator, ast.IsNot):
+                        comparison = left is not right
+                    elif isinstance(operator, ast.In):
+                        comparison = left in right
+                    elif isinstance(operator, ast.NotIn):
+                        comparison = left not in right
+                    else:
+                        return cls._UNKNOWN
+                except (TypeError, ValueError):
+                    return cls._UNKNOWN
+                if not comparison:
+                    return False
+                left = right
+            return True
+        if isinstance(node, ast.IfExp):
+            truth_value = cls._constant_truth_value(node.test)
+            if truth_value is None:
+                return cls._UNKNOWN
+            return cls._constant_value(node.body if truth_value else node.orelse)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "range"
+            and not node.keywords
+        ):
+            arguments = [cls._constant_value(argument) for argument in node.args]
+            if all(argument is not cls._UNKNOWN for argument in arguments):
+                try:
+                    return range(*arguments)
+                except (TypeError, ValueError):
+                    return cls._UNKNOWN
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "set"
+            and not node.args
+            and not node.keywords
+        ):
+            return set()
         try:
-            return bool(ast.literal_eval(node))
+            return ast.literal_eval(node)
         except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
-            return None
+            return cls._UNKNOWN
+
+    @classmethod
+    def _constant_truth_value(cls, node):
+        value = cls._constant_value(node)
+        return None if value is cls._UNKNOWN else bool(value)
 
     @classmethod
     def _executable_nodes_in_statements(cls, statements):
         nodes = []
+        node_ids = set()
 
-        class ExecutableBodyVisitor(ast.NodeVisitor):
-            def visit(self, node):
+        def add_node(node):
+            if id(node) not in node_ids:
+                node_ids.add(id(node))
                 nodes.append(node)
-                return super().visit(node)
 
-            def visit_AsyncFunctionDef(self, node):
-                return None
-
-            def visit_FunctionDef(self, node):
-                return None
-
-            def visit_Lambda(self, node):
-                return None
-
-            def visit_ClassDef(self, node):
-                return None
-
-            def visit_If(self, node):
-                self.visit(node.test)
-                truth_value = cls._constant_truth_value(node.test)
-                selected_statements = node.body if truth_value is True else (
-                    node.orelse if truth_value is False else [*node.body, *node.orelse]
-                )
-                for statement in selected_statements:
-                    self.visit(statement)
-
-            def visit_IfExp(self, node):
-                self.visit(node.test)
+        def visit_expression(node):
+            if node is None:
+                return
+            add_node(node)
+            if isinstance(node, ast.Lambda):
+                return
+            if isinstance(node, ast.BoolOp):
+                for value_node in node.values:
+                    visit_expression(value_node)
+                    truth_value = cls._constant_truth_value(value_node)
+                    if isinstance(node.op, ast.And) and truth_value is False:
+                        break
+                    if isinstance(node.op, ast.Or) and truth_value is True:
+                        break
+                return
+            if isinstance(node, ast.IfExp):
+                visit_expression(node.test)
                 truth_value = cls._constant_truth_value(node.test)
                 if truth_value is True:
-                    self.visit(node.body)
+                    visit_expression(node.body)
                 elif truth_value is False:
-                    self.visit(node.orelse)
+                    visit_expression(node.orelse)
                 else:
-                    self.visit(node.body)
-                    self.visit(node.orelse)
+                    visit_expression(node.body)
+                    visit_expression(node.orelse)
+                return
+            if isinstance(node, ast.Compare):
+                visit_expression(node.left)
+                left = node.left
+                for operator, comparator in zip(node.ops, node.comparators):
+                    visit_expression(comparator)
+                    single_comparison = ast.Compare(left=left, ops=[operator], comparators=[comparator])
+                    if cls._constant_truth_value(single_comparison) is False:
+                        break
+                    left = comparator
+                return
+            for child in ast.iter_child_nodes(node):
+                if not isinstance(child, ast.stmt):
+                    visit_expression(child)
 
-            def visit_While(self, node):
-                self.visit(node.test)
+        def visit_statements(block):
+            exits = {"fallthrough"}
+            for statement in block:
+                if "fallthrough" not in exits:
+                    break
+                completed_paths = exits - {"fallthrough"}
+                exits = completed_paths | visit_statement(statement)
+            return exits
+
+        def visit_statement(node):
+            add_node(node)
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef, ast.ClassDef)):
+                return {"fallthrough"}
+            if isinstance(node, ast.Return):
+                visit_expression(node.value)
+                return {"return"}
+            if isinstance(node, ast.Raise):
+                visit_expression(node.exc)
+                visit_expression(node.cause)
+                return {"raise"}
+            if isinstance(node, ast.Break):
+                return {"break"}
+            if isinstance(node, ast.Continue):
+                return {"continue"}
+            if isinstance(node, ast.If):
+                visit_expression(node.test)
                 truth_value = cls._constant_truth_value(node.test)
-                if truth_value is not False:
-                    for statement in node.body:
-                        self.visit(statement)
-                for statement in node.orelse:
-                    self.visit(statement)
+                if truth_value is True:
+                    return visit_statements(node.body)
+                if truth_value is False:
+                    return visit_statements(node.orelse)
+                return visit_statements(node.body) | visit_statements(node.orelse)
+            if isinstance(node, ast.While):
+                visit_expression(node.test)
+                truth_value = cls._constant_truth_value(node.test)
+                if truth_value is False:
+                    return visit_statements(node.orelse)
+                body_exits = visit_statements(node.body)
+                exits = body_exits & {"return", "raise"}
+                if "break" in body_exits:
+                    exits.add("fallthrough")
+                if truth_value is True:
+                    return exits
+                return exits | visit_statements(node.orelse)
+            if isinstance(node, (ast.For, ast.AsyncFor)):
+                visit_expression(node.target)
+                visit_expression(node.iter)
+                iterable = cls._constant_value(node.iter)
+                if iterable is not cls._UNKNOWN:
+                    try:
+                        if len(iterable) == 0:
+                            return visit_statements(node.orelse)
+                    except TypeError:
+                        pass
+                body_exits = visit_statements(node.body)
+                exits = body_exits & {"return", "raise"}
+                if "break" in body_exits:
+                    exits.add("fallthrough")
+                normal_completion = bool(body_exits & {"fallthrough", "continue"})
+                if iterable is cls._UNKNOWN or normal_completion:
+                    exits |= visit_statements(node.orelse)
+                return exits
+            if isinstance(node, ast.Try):
+                body_exits = visit_statements(node.body)
+                protected_exits = body_exits - {"fallthrough"}
+                for handler in node.handlers:
+                    add_node(handler)
+                    visit_expression(handler.type)
+                    protected_exits |= visit_statements(handler.body)
+                if "fallthrough" in body_exits:
+                    if node.orelse:
+                        protected_exits |= visit_statements(node.orelse)
+                    else:
+                        protected_exits.add("fallthrough")
+                if not node.finalbody:
+                    return protected_exits
+                final_exits = visit_statements(node.finalbody)
+                exits = final_exits - {"fallthrough"}
+                if "fallthrough" in final_exits:
+                    exits |= protected_exits
+                return exits
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    visit_expression(item.context_expr)
+                    visit_expression(item.optional_vars)
+                return visit_statements(node.body)
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.stmt):
+                    visit_statement(child)
+                else:
+                    visit_expression(child)
+            return {"fallthrough"}
 
-        visitor = ExecutableBodyVisitor()
-        for statement in statements:
-            visitor.visit(statement)
+        visit_statements(statements)
         return nodes
 
     @classmethod
@@ -204,9 +371,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         return cls._executable_nodes_in_statements(function_node.body)
 
     @staticmethod
-    def _is_self_receiver(node):
-        while isinstance(node, ast.Attribute):
-            node = node.value
+    def _is_direct_self_or_super_receiver(node):
         return (
             isinstance(node, ast.Name)
             and node.id == "self"
@@ -219,6 +384,117 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         )
 
     @staticmethod
+    def _annotation_names_ws_assistant(annotation):
+        return annotation is not None and "WSAssistant" in ast.unparse(annotation)
+
+    @classmethod
+    def _permitted_websocket_receivers(cls, function_node):
+        receivers = {
+            argument.arg
+            for argument in [*function_node.args.posonlyargs, *function_node.args.args, *function_node.args.kwonlyargs]
+            if cls._annotation_names_ws_assistant(argument.annotation)
+        }
+
+        class ReceiverVisitor(ast.NodeVisitor):
+            def visit_AsyncFunctionDef(self, node):
+                return None
+
+            def visit_FunctionDef(self, node):
+                return None
+
+            def visit_Lambda(self, node):
+                return None
+
+            def visit_ClassDef(self, node):
+                return None
+
+            def visit_AnnAssign(self, node):
+                if isinstance(node.target, ast.Name) and cls._annotation_names_ws_assistant(node.annotation):
+                    receivers.add(node.target.id)
+                self.generic_visit(node)
+
+            def visit_Assign(self, node):
+                value = node.value.value if isinstance(node.value, ast.Await) else node.value
+                if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
+                    if value.func.attr in {"get_ws_assistant", "_connected_websocket_assistant"}:
+                        for target in node.targets:
+                            if isinstance(target, ast.Name):
+                                receivers.add(target.id)
+                self.generic_visit(node)
+
+        visitor = ReceiverVisitor()
+        for statement in function_node.body:
+            visitor.visit(statement)
+        return receivers
+
+    @staticmethod
+    def _function_local_bindings(function_node):
+        bindings = {
+            argument.arg
+            for argument in [
+                *function_node.args.posonlyargs,
+                *function_node.args.args,
+                *function_node.args.kwonlyargs,
+            ]
+        }
+        if function_node.args.vararg is not None:
+            bindings.add(function_node.args.vararg.arg)
+        if function_node.args.kwarg is not None:
+            bindings.add(function_node.args.kwarg.arg)
+
+        class BindingVisitor(ast.NodeVisitor):
+            def visit_Name(self, node):
+                if isinstance(node.ctx, ast.Store):
+                    bindings.add(node.id)
+
+            def visit_AsyncFunctionDef(self, node):
+                bindings.add(node.name)
+
+            def visit_FunctionDef(self, node):
+                bindings.add(node.name)
+
+            def visit_Lambda(self, node):
+                return None
+
+            def visit_ClassDef(self, node):
+                bindings.add(node.name)
+
+            def visit_Import(self, node):
+                bindings.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+
+            def visit_ImportFrom(self, node):
+                bindings.update(alias.asname or alias.name for alias in node.names)
+
+            def visit_ExceptHandler(self, node):
+                if node.name is not None:
+                    bindings.add(node.name)
+                self.generic_visit(node)
+
+        visitor = BindingVisitor()
+        for statement in function_node.body:
+            visitor.visit(statement)
+        return bindings
+
+    @classmethod
+    def _is_valid_tasks_future(cls, function_node, await_node):
+        for node in cls._executable_body_nodes(function_node):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.lineno >= await_node.lineno:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if not any(isinstance(target, ast.Name) and target.id == "tasks_future" for target in targets):
+                continue
+            value = node.value
+            if (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and isinstance(value.func.value, ast.Name)
+                and value.func.value.id == "asyncio"
+                and value.func.attr == "gather"
+            ):
+                return True
+        return False
+
+    @staticmethod
     def _awaited_callable(node):
         if not isinstance(node, ast.Await):
             return None
@@ -226,8 +502,9 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         return awaited.func if isinstance(awaited, ast.Call) else awaited
 
     @classmethod
-    def _is_disconnect_boundary_await(cls, node):
+    def _is_disconnect_boundary_await(cls, function_node, node):
         return cls._is_lifecycle_boundary_await(
+            function_node,
             node,
             {"_on_order_stream_interruption", "disconnect", "await_primary_then_cleanup"},
         )
@@ -240,18 +517,34 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         )
 
     @classmethod
-    def _is_lifecycle_boundary_await(cls, node, expected_names):
+    def _is_lifecycle_boundary_await(cls, function_node, node, expected_names):
         function = cls._awaited_callable(node)
         function_name = cls._awaited_name(node)
         if function_name not in expected_names:
             return False
         if isinstance(function, ast.Name):
-            return function_name in {"await_primary_then_cleanup", "tasks_future"}
+            if function_name == "tasks_future":
+                return cls._is_valid_tasks_future(function_node, node)
+            return (
+                function_name in {"await_primary_then_cleanup", "safe_gather"}
+                and function_name not in cls._function_local_bindings(function_node)
+            )
         if not isinstance(function, ast.Attribute):
             return False
         if function_name == "disconnect":
-            return True
-        return cls._is_self_receiver(function.value)
+            return (
+                isinstance(function.value, ast.Name)
+                and function.value.id in cls._permitted_websocket_receivers(function_node)
+            )
+        if function_name == "_on_order_stream_interruption":
+            return cls._is_direct_self_or_super_receiver(function.value)
+        if function_name == "start":
+            return (
+                isinstance(function.value, ast.Attribute)
+                and function.value.attr == "_data_source"
+                and cls._is_direct_self_or_super_receiver(function.value.value)
+            )
+        return cls._is_direct_self_or_super_receiver(function.value)
 
     @staticmethod
     def _expected_lifecycle_boundary_names(definition, function_node):
@@ -305,8 +598,13 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         if any(nested is cleanup_node for nested in cls._executable_nodes_in_statements([await_node])):
             return True
         for try_node in (node for node in cls._executable_body_nodes(function_node) if isinstance(node, ast.Try)):
+            protected_statements = [
+                *try_node.body,
+                *(statement for handler in try_node.handlers for statement in handler.body),
+                *try_node.orelse,
+            ]
             await_is_in_body = any(
-                nested is await_node for nested in cls._executable_nodes_in_statements(try_node.body)
+                nested is await_node for nested in cls._executable_nodes_in_statements(protected_statements)
             )
             cleanup_is_in_finally = any(
                 nested is cleanup_node for nested in cls._executable_nodes_in_statements(try_node.finalbody)
@@ -332,14 +630,14 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
 
         expected_boundary_names = self._expected_lifecycle_boundary_names(definition, function_node)
         lifecycle_awaits = [node for node in executable_nodes
-                            if self._is_lifecycle_boundary_await(node, expected_boundary_names)]
+                            if self._is_lifecycle_boundary_await(function_node, node, expected_boundary_names)]
         self.assertTrue(
             lifecycle_awaits,
             f"{definition} must contain a recognized awaited lifecycle boundary",
         )
 
         disconnect_awaits = [
-            node for node in executable_nodes if self._is_disconnect_boundary_await(node)
+            node for node in executable_nodes if self._is_disconnect_boundary_await(function_node, node)
         ]
         task_cleanups = [node for node in executable_nodes if self._is_owned_task_cleanup(node)]
         for disconnect_await in disconnect_awaits:
@@ -388,7 +686,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
 
     def test_static_audit_rejects_unsafe_exact_local_task_cleanup(self):
         function_node = ast.parse(
-            "async def listen_for_subscriptions(self, websocket):\n"
+            "async def listen_for_subscriptions(self, websocket: WSAssistant):\n"
             "    task = self._listen_task\n"
             "    await websocket.disconnect()\n"
             "    task.cancel()\n"
@@ -434,6 +732,124 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
 
         with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
             self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+    def test_static_audit_rejects_disconnect_on_unrelated_receiver(self):
+        function_node = ast.parse(
+            "async def listen_for_subscriptions(self, unrelated):\n"
+            "    await unrelated.disconnect()\n"
+        ).body[0]
+
+        with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+            self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+    def test_static_audit_rejects_chained_self_receiver(self):
+        function_node = ast.parse(
+            "async def listen_for_subscriptions(self):\n"
+            "    await self.unrelated._on_order_stream_interruption()\n"
+        ).body[0]
+
+        with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+            self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+    def test_static_audit_rejects_shadowed_helper_parameter(self):
+        function_node = ast.parse(
+            "async def listen_for_subscriptions(self, await_primary_then_cleanup):\n"
+            "    await await_primary_then_cleanup(None, None, None, 'cleanup')\n"
+        ).body[0]
+
+        with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+            self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+    def test_static_audit_rejects_false_literal_comparison_and_boolean_operands(self):
+        sources = (
+            "async def listen_for_subscriptions(self):\n"
+            "    if 1 == 2:\n"
+            "        await self._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self):\n"
+            "    False and await self._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self):\n"
+            "    True or await self._on_order_stream_interruption()\n",
+        )
+
+        for source in sources:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+                    self._audit_definition(
+                        "mutated:Listener.listen_for_subscriptions",
+                        ast.parse(source).body[0],
+                    )
+
+    def test_static_audit_rejects_boundary_inside_constant_empty_iterables(self):
+        for iterable in ("()", "[]", "{}", "set()", "range(0)"):
+            with self.subTest(iterable=iterable):
+                function_node = ast.parse(
+                    "async def listen_for_subscriptions(self):\n"
+                    f"    for _ in {iterable}:\n"
+                    "        await self._on_order_stream_interruption()\n"
+                ).body[0]
+
+                with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+                    self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+    def test_static_audit_rejects_boundary_after_unconditional_terminator(self):
+        for terminator in ("return", "raise RuntimeError('stop')"):
+            with self.subTest(terminator=terminator):
+                function_node = ast.parse(
+                    "async def listen_for_subscriptions(self):\n"
+                    f"    {terminator}\n"
+                    "    await self._on_order_stream_interruption()\n"
+                ).body[0]
+
+                with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+                    self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+    def test_static_audit_rejects_unreachable_while_body_and_else(self):
+        sources = (
+            "async def listen_for_subscriptions(self):\n"
+            "    while False:\n"
+            "        await self._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self):\n"
+            "    while True:\n"
+            "        return\n"
+            "    else:\n"
+            "        await self._on_order_stream_interruption()\n",
+        )
+
+        for source in sources:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+                    self._audit_definition(
+                        "mutated:Listener.listen_for_subscriptions",
+                        ast.parse(source).body[0],
+                    )
+
+    def test_static_audit_includes_reachable_try_except_else_and_finally_paths(self):
+        sources = (
+            "async def listen_for_subscriptions(self):\n"
+            "    try:\n"
+            "        await self._sleep(1)\n"
+            "    except Exception:\n"
+            "        await self._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self):\n"
+            "    try:\n"
+            "        await self._sleep(1)\n"
+            "    except Exception:\n"
+            "        raise\n"
+            "    else:\n"
+            "        await self._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self):\n"
+            "    try:\n"
+            "        await self._sleep(1)\n"
+            "    finally:\n"
+            "        await self._on_order_stream_interruption()\n",
+        )
+
+        for source in sources:
+            with self.subTest(source=source):
+                self._audit_definition(
+                    "mutated:Listener.listen_for_subscriptions",
+                    ast.parse(source).body[0],
+                )
 
 
 class _ControllableConnection:

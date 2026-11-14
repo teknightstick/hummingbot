@@ -613,7 +613,11 @@ class CandlesBase(NetworkBase):
 
     def _create_fill_candles_task(self, websocket_assistant: WSAssistant, task_factory) -> asyncio.Task:
         fill_candles_task = self._fill_candles_task_owner.create_task(websocket_assistant, task_factory)
-        self._fill_candles_task = fill_candles_task
+        self._fill_candles_task = (
+            fill_candles_task
+            if self._fill_candles_task_owner.task_for(websocket_assistant) is fill_candles_task
+            else None
+        )
         return fill_candles_task
 
     @property

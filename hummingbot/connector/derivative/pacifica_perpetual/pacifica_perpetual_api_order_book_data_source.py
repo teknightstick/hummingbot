@@ -192,21 +192,23 @@ class PacificaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             ws: WSAssistant = await self._api_factory.get_ws_assistant()
             try:
                 await ws.connect(ws_url=web_utils.wss_url(self._domain), ws_headers=self._get_headers())
+                self._create_ping_task(ws, lambda: safe_ensure_future(self._ping_loop(ws)))
             except BaseException:
                 try:
                     await ws.disconnect()
                 except BaseException as cleanup_error:
                     self.logger().error(
-                        "Error while cleaning up a Pacifica WebSocket assistant after connection failure",
+                        "Error while cleaning up a Pacifica WebSocket assistant after connection setup failure",
                         exc_info=(type(cleanup_error), cleanup_error, cleanup_error.__traceback__),
                     )
                 raise
-            self._create_ping_task(ws, lambda: safe_ensure_future(self._ping_loop(ws)))
             return ws
 
     def _create_ping_task(self, websocket_assistant: WSAssistant, task_factory) -> asyncio.Task:
         ping_task = self._ping_task_owner.create_task(websocket_assistant, task_factory)
-        self._ping_task = ping_task
+        self._ping_task = (
+            ping_task if self._ping_task_owner.task_for(websocket_assistant) is ping_task else None
+        )
         return ping_task
 
     @property
