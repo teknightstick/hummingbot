@@ -961,6 +961,15 @@ class ExchangePyBase(ExchangeBase, ABC):
         return registry
 
     @staticmethod
+    async def _wait_for_stopped_order_book_tracker(tracker: OrderBookTracker) -> bool:
+        already_stopped_context = tracker._stop_and_wait_already_stopped_context
+        reset_token = already_stopped_context.set(object())
+        try:
+            return await tracker.stop_and_wait()
+        finally:
+            already_stopped_context.reset(reset_token)
+
+    @staticmethod
     def _begin_network_task_publication_scan(connector):
         connector._network_task_publication_fence_active = True
         connector._network_task_publication_scan_depth = (
@@ -1077,19 +1086,17 @@ class ExchangePyBase(ExchangeBase, ABC):
                 self._last_poll_timestamp = 0
                 self._last_timestamp = 0
                 self._poll_notifier = asyncio.Event()
-                self.order_book_tracker.stop()
+                order_book_tracker = self.order_book_tracker
+                order_book_tracker.stop()
 
-                tracker_drain_method = getattr(
-                    type(self.order_book_tracker),
-                    "_drain_stopped_tasks",
-                    None,
-                )
-                if tracker_drain_method is None:
-                    # Preserve compatibility with legacy tracker doubles that
-                    # expose only the original public stop-and-wait shape.
-                    tracker_drain = self.order_book_tracker.stop_and_wait()
+                if isinstance(order_book_tracker, OrderBookTracker):
+                    tracker_drain = ExchangePyBase._wait_for_stopped_order_book_tracker(
+                        order_book_tracker
+                    )
                 else:
-                    tracker_drain = tracker_drain_method(self.order_book_tracker)
+                    # Preserve compatibility with legacy tracker doubles using
+                    # the original public no-argument stop-and-wait shape.
+                    tracker_drain = order_book_tracker.stop_and_wait()
                 tracker_drain_task = asyncio.ensure_future(tracker_drain)
                 cleanup_tasks.append(tracker_drain_task)
                 ExchangePyBase._track_network_task(self, tracker_drain_task)

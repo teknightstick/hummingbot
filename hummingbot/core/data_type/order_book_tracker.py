@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 from collections import defaultdict, deque
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Deque, Dict, List, Optional, Tuple
@@ -361,6 +362,10 @@ class OrderBookTracker:
         self._saved_message_queues: Dict[str, Deque[OrderBookMessage]] = defaultdict(lambda: deque(maxlen=1000))
         self._generation: int = 0
         self._active_generation: Optional[int] = None
+        self._stop_and_wait_already_stopped_context: ContextVar = ContextVar(
+            f"order_book_tracker_already_stopped_{id(self)}",
+            default=None,
+        )
         self._tasks_to_drain: set[asyncio.Task] = set()
         self._in_flight_transactions: set[asyncio.Task] = set()
         self._pair_transaction_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
@@ -593,7 +598,13 @@ class OrderBookTracker:
 
     async def stop_and_wait(self, timeout: float = 10.0) -> bool:
         """Stop immediately, then wait up to ``timeout`` seconds for owned tasks to drain."""
-        self.stop()
+        already_stopped_token = self._stop_and_wait_already_stopped_context.get()
+        if already_stopped_token is None:
+            self.stop()
+        else:
+            # Consume the connector-owned one-shot before the first await so
+            # only this public call can skip its duplicate stop.
+            self._stop_and_wait_already_stopped_context.set(None)
         return await self._drain_stopped_tasks(timeout)
 
     async def _drain_stopped_tasks(self, timeout: float = 10.0) -> bool:

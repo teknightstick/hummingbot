@@ -181,16 +181,180 @@ class ExchangePyBaseTrackerLifecycleTests(IsolatedAsyncioWrapperTestCase):
         tracker = OrderBookTracker(data_source=MagicMock(), trading_pairs=[])
         connector = self._connector(tracker)
         stop = MagicMock(wraps=tracker.stop)
-        drain_stopped_tasks = AsyncMock(wraps=OrderBookTracker._drain_stopped_tasks)
+        stop_and_wait = AsyncMock(wraps=tracker.stop_and_wait)
         tracker.stop = stop
+        tracker.stop_and_wait = stop_and_wait
 
-        with patch.object(OrderBookTracker, "_drain_stopped_tasks", drain_stopped_tasks):
-            result = await ExchangePyBase.stop_network(connector)
+        result = await ExchangePyBase.stop_network(connector)
 
         self.assertIsNone(result)
         stop.assert_called_once_with()
-        drain_stopped_tasks.assert_awaited_once_with(tracker)
+        stop_and_wait.assert_awaited_once_with()
         self.assertEqual(set(), connector._network_tasks_to_drain)
+
+    async def test_stop_network_dispatches_through_real_tracker_subclass_public_override(self):
+        class OverridingTracker(OrderBookTracker):
+            def __init__(self):
+                super().__init__(data_source=MagicMock(), trading_pairs=[])
+                self.public_stop_and_wait_calls = 0
+
+            async def stop_and_wait(self):
+                self.public_stop_and_wait_calls += 1
+                return await super().stop_and_wait()
+
+        tracker = OverridingTracker()
+        stop = MagicMock(wraps=tracker.stop)
+        tracker.stop = stop
+        connector = self._connector(tracker)
+
+        result = await ExchangePyBase.stop_network(connector)
+
+        self.assertIsNone(result)
+        self.assertEqual(1, tracker.public_stop_and_wait_calls)
+        stop.assert_called_once_with()
+
+    async def test_stop_network_ignores_colliding_protected_name_on_unrelated_tracker(self):
+        class UnrelatedTracker:
+            def __init__(self):
+                self.stop_calls = 0
+                self.public_stop_and_wait_calls = 0
+                self.protected_drain_calls = 0
+
+            def stop(self):
+                self.stop_calls += 1
+
+            async def stop_and_wait(self):
+                self.public_stop_and_wait_calls += 1
+                return True
+
+            async def _drain_stopped_tasks(self, required_argument):
+                self.protected_drain_calls += 1
+                return required_argument
+
+        tracker = UnrelatedTracker()
+        connector = self._connector(tracker)
+
+        result = await ExchangePyBase.stop_network(connector)
+
+        self.assertIsNone(result)
+        self.assertEqual(1, tracker.stop_calls)
+        self.assertEqual(1, tracker.public_stop_and_wait_calls)
+        self.assertEqual(0, tracker.protected_drain_calls)
+
+    async def test_unused_already_stopped_token_does_not_suppress_later_direct_stop(self):
+        class NonDelegatingTracker(OrderBookTracker):
+            def __init__(self):
+                super().__init__(data_source=MagicMock(), trading_pairs=[])
+                self.public_stop_and_wait_calls = 0
+
+            async def stop_and_wait(self):
+                self.public_stop_and_wait_calls += 1
+                return True
+
+        tracker = NonDelegatingTracker()
+        stop = MagicMock(wraps=tracker.stop)
+        tracker.stop = stop
+        connector = self._connector(tracker)
+
+        self.assertIsNone(await ExchangePyBase.stop_network(connector))
+        self.assertEqual(1, tracker.public_stop_and_wait_calls)
+        stop.assert_called_once_with()
+
+        self.assertTrue(await OrderBookTracker.stop_and_wait(tracker, timeout=0.2))
+        self.assertEqual(2, stop.call_count)
+
+    async def test_public_override_error_clears_token_and_allows_clean_retry(self):
+        class FailingOnceTracker(OrderBookTracker):
+            def __init__(self):
+                super().__init__(data_source=MagicMock(), trading_pairs=[])
+                self.public_stop_and_wait_calls = 0
+
+            async def stop_and_wait(self):
+                self.public_stop_and_wait_calls += 1
+                if self.public_stop_and_wait_calls == 1:
+                    raise RuntimeError("override-drain-failed")
+                return await super().stop_and_wait()
+
+        tracker = FailingOnceTracker()
+        stop = MagicMock(wraps=tracker.stop)
+        tracker.stop = stop
+        connector = self._connector(tracker)
+
+        with self.assertRaisesRegex(NetworkLifecycleError, "cleanup task failed") as raised:
+            await ExchangePyBase.stop_network(connector)
+
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        self.assertIsNone(await ExchangePyBase.stop_network(connector))
+        self.assertEqual(2, tracker.public_stop_and_wait_calls)
+        self.assertEqual(2, stop.call_count)
+
+        self.assertTrue(await OrderBookTracker.stop_and_wait(tracker, timeout=0.2))
+        self.assertEqual(3, stop.call_count)
+
+    async def test_cancelled_connector_stop_does_not_leak_token_to_direct_call(self):
+        class BlockingTracker(OrderBookTracker):
+            def __init__(self):
+                super().__init__(data_source=MagicMock(), trading_pairs=[])
+                self.public_stop_and_wait_calls = 0
+                self.public_stop_and_wait_entered = asyncio.Event()
+                self.public_stop_and_wait_release = asyncio.Event()
+
+            async def stop_and_wait(self):
+                self.public_stop_and_wait_calls += 1
+                self.public_stop_and_wait_entered.set()
+                await self.public_stop_and_wait_release.wait()
+                return await super().stop_and_wait()
+
+        tracker = BlockingTracker()
+        stop = MagicMock(wraps=tracker.stop)
+        tracker.stop = stop
+        connector = self._connector(tracker)
+        connector_stop = asyncio.create_task(ExchangePyBase.stop_network(connector))
+
+        try:
+            await asyncio.wait_for(tracker.public_stop_and_wait_entered.wait(), timeout=0.2)
+            connector_stop.cancel("connector-stop-cancelled")
+            with self.assertRaises(asyncio.CancelledError) as raised:
+                await connector_stop
+            self.assertEqual(("connector-stop-cancelled",), raised.exception.args)
+
+            self.assertTrue(await OrderBookTracker.stop_and_wait(tracker, timeout=0.2))
+            self.assertEqual(2, stop.call_count)
+
+            tracker.public_stop_and_wait_release.set()
+            pending_cleanup = tuple(connector._network_tasks_to_drain)
+            await asyncio.gather(*pending_cleanup)
+            self.assertEqual(2, stop.call_count)
+        finally:
+            tracker.public_stop_and_wait_release.set()
+            connector_stop.cancel()
+            await asyncio.gather(connector_stop, return_exceptions=True)
+            pending_cleanup = tuple(getattr(connector, "_network_tasks_to_drain", ()))
+            await asyncio.gather(*pending_cleanup, return_exceptions=True)
+
+    async def test_concurrent_connector_stops_each_use_one_public_one_shot_dispatch(self):
+        class CountingTracker(OrderBookTracker):
+            def __init__(self):
+                super().__init__(data_source=MagicMock(), trading_pairs=[])
+                self.public_stop_and_wait_calls = 0
+
+            async def stop_and_wait(self):
+                self.public_stop_and_wait_calls += 1
+                await asyncio.sleep(0)
+                return await super().stop_and_wait()
+
+        tracker = CountingTracker()
+        stop = MagicMock(wraps=tracker.stop)
+        tracker.stop = stop
+        connector = self._connector(tracker)
+
+        results = await asyncio.gather(
+            *(ExchangePyBase.stop_network(connector) for _ in range(4))
+        )
+
+        self.assertEqual([None, None, None, None], results)
+        self.assertEqual(4, tracker.public_stop_and_wait_calls)
+        self.assertEqual(4, stop.call_count)
 
     async def test_cancelled_queued_stop_does_not_allocate_or_invalidate_generation(self):
         first_drain_entered = asyncio.Event()
