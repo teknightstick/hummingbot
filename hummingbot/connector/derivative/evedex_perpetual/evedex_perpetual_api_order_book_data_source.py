@@ -498,5 +498,4 @@ class EvedexPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 pass
             self._ping_task = None
 
-        self._ws_assistant = None
         await super()._on_order_stream_interruption(websocket_assistant=websocket_assistant)

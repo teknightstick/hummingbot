@@ -6,8 +6,10 @@ This module tests:
 - add_trading_pair: Adds a trading pair to the internal list
 - remove_trading_pair: Removes a trading pair from the internal list
 """
+import ast
 import asyncio
 import unittest
+from pathlib import Path
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from typing import Any, Dict, List, Optional
 
@@ -20,6 +22,159 @@ from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 
 
 _END_OF_STREAM = object()
+
+
+EXPECTED_ORDER_STREAM_DEFINITIONS = {
+    "hummingbot/connector/derivative/binance_perpetual/binance_perpetual_api_order_book_data_source.py:"
+    "BinancePerpetualAPIOrderBookDataSource.listen_for_subscriptions",
+    "hummingbot/connector/derivative/bitget_perpetual/bitget_perpetual_api_order_book_data_source.py:"
+    "BitgetPerpetualAPIOrderBookDataSource.listen_for_subscriptions",
+    "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
+    "BybitPerpetualAPIOrderBookDataSource.listen_for_subscriptions",
+    "hummingbot/connector/derivative/evedex_perpetual/evedex_perpetual_api_order_book_data_source.py:"
+    "EvedexPerpetualAPIOrderBookDataSource._on_order_stream_interruption",
+    "hummingbot/connector/derivative/injective_v2_perpetual/"
+    "injective_v2_perpetual_api_order_book_data_source.py:"
+    "InjectiveV2PerpetualAPIOrderBookDataSource.listen_for_subscriptions",
+    "hummingbot/connector/derivative/pacifica_perpetual/pacifica_perpetual_api_order_book_data_source.py:"
+    "PacificaPerpetualAPIOrderBookDataSource._on_order_stream_interruption",
+    "hummingbot/connector/exchange/bing_x/bing_x_api_order_book_data_source.py:"
+    "BingXAPIOrderBookDataSource.listen_for_subscriptions",
+    "hummingbot/connector/exchange/bitget/bitget_api_order_book_data_source.py:"
+    "BitgetAPIOrderBookDataSource.listen_for_subscriptions",
+    "hummingbot/connector/exchange/bybit/bybit_api_order_book_data_source.py:"
+    "BybitAPIOrderBookDataSource.listen_for_subscriptions",
+    "hummingbot/connector/exchange/gemini/gemini_api_order_book_data_source.py:"
+    "GeminiAPIOrderBookDataSource._on_order_stream_interruption",
+    "hummingbot/connector/exchange/injective_v2/injective_v2_api_order_book_data_source.py:"
+    "InjectiveV2APIOrderBookDataSource.listen_for_subscriptions",
+    "hummingbot/connector/exchange/xrpl/xrpl_api_order_book_data_source.py:"
+    "XRPLAPIOrderBookDataSource.listen_for_subscriptions",
+    "hummingbot/core/data_type/order_book_tracker_data_source.py:"
+    "OrderBookTrackerDataSource.listen_for_subscriptions",
+    "hummingbot/core/data_type/order_book_tracker_data_source.py:"
+    "OrderBookTrackerDataSource._on_order_stream_interruption",
+    "hummingbot/data_feed/candles_feed/bitget_perpetual_candles/bitget_perpetual_candles.py:"
+    "BitgetPerpetualCandles.listen_for_subscriptions",
+    "hummingbot/data_feed/candles_feed/bitget_spot_candles/bitget_spot_candles.py:"
+    "BitgetSpotCandles.listen_for_subscriptions",
+    "hummingbot/data_feed/candles_feed/btc_markets_spot_candles/btc_markets_spot_candles.py:"
+    "BtcMarketsSpotCandles.listen_for_subscriptions",
+    "hummingbot/data_feed/candles_feed/candles_base.py:CandlesBase.listen_for_subscriptions",
+    "hummingbot/data_feed/candles_feed/candles_base.py:CandlesBase._on_order_stream_interruption",
+    "hummingbot/data_feed/candles_feed/evedex_perpetual_candles/evedex_perpetual_candles.py:"
+    "EvedexPerpetualCandles._on_order_stream_interruption",
+    "hummingbot/data_feed/candles_feed/hyperliquid_perpetual_candles/hyperliquid_perpetual_candles.py:"
+    "HyperliquidPerpetualCandles._on_order_stream_interruption",
+    "hummingbot/data_feed/candles_feed/lighter_perpetual_candles/lighter_perpetual_candles.py:"
+    "LighterPerpetualCandles.listen_for_subscriptions",
+    "hummingbot/data_feed/candles_feed/lighter_spot_candles/lighter_spot_candles.py:"
+    "LighterSpotCandles.listen_for_subscriptions",
+    "hummingbot/data_feed/liquidations_feed/liquidations_base.py:LiquidationsBase.listen_for_subscriptions",
+    "hummingbot/data_feed/liquidations_feed/liquidations_base.py:LiquidationsBase._on_order_stream_interruption",
+}
+
+
+class OrderStreamOverrideStaticTests(unittest.TestCase):
+    @staticmethod
+    def _production_definitions():
+        repository_root = Path(__file__).resolve().parents[4]
+        definitions = {}
+        for path in sorted((repository_root / "hummingbot").rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            relative_path = path.relative_to(repository_root).as_posix()
+            for class_node in (node for node in tree.body if isinstance(node, ast.ClassDef)):
+                for function_node in (
+                    node
+                    for node in class_node.body
+                    if isinstance(node, ast.AsyncFunctionDef)
+                    and node.name in {"listen_for_subscriptions", "_on_order_stream_interruption"}
+                ):
+                    key = f"{relative_path}:{class_node.name}.{function_node.name}"
+                    definitions[key] = function_node
+        return definitions
+
+    @staticmethod
+    def _assigned_self_attribute(node):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self":
+                return target.attr
+        return None
+
+    @staticmethod
+    def _is_super_interruption_await(node):
+        if not isinstance(node, ast.Await) or not isinstance(node.value, ast.Call):
+            return False
+        function = node.value.func
+        return (
+            isinstance(function, ast.Attribute)
+            and function.attr == "_on_order_stream_interruption"
+            and isinstance(function.value, ast.Call)
+            and isinstance(function.value.func, ast.Name)
+            and function.value.func.id == "super"
+        )
+
+    @classmethod
+    def _is_owned_task_cleanup(cls, node):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            attribute = cls._assigned_self_attribute(node)
+            return attribute is not None and attribute.endswith("_task") and isinstance(node.value, ast.Constant) \
+                and node.value.value is None
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "cancel":
+            task = node.func.value
+            return (
+                isinstance(task, ast.Attribute)
+                and isinstance(task.value, ast.Name)
+                and task.value.id == "self"
+                and task.attr.endswith("_task")
+            )
+        return False
+
+    @staticmethod
+    def _cleanup_is_in_finally_for_await(function_node, cleanup_node, await_node):
+        for try_node in (node for node in ast.walk(function_node) if isinstance(node, ast.Try)):
+            await_is_in_body = any(
+                nested is await_node for statement in try_node.body for nested in ast.walk(statement)
+            )
+            cleanup_is_in_finally = any(
+                nested is cleanup_node for statement in try_node.finalbody for nested in ast.walk(statement)
+            )
+            if await_is_in_body and cleanup_is_in_finally:
+                return True
+        return False
+
+    def test_all_order_stream_definitions_obey_interruption_ownership_boundaries(self):
+        definitions = self._production_definitions()
+        self.assertEqual(EXPECTED_ORDER_STREAM_DEFINITIONS, set(definitions))
+        self.assertEqual(25, len(definitions))
+
+        for definition, function_node in definitions.items():
+            if function_node.name != "_on_order_stream_interruption":
+                continue
+            for node in ast.walk(function_node):
+                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    assigned_attribute = self._assigned_self_attribute(node)
+                    clears_assistant = (
+                        assigned_attribute == "_ws_assistant"
+                        and isinstance(node.value, ast.Constant)
+                        and node.value.value is None
+                    )
+                    self.assertFalse(
+                        clears_assistant,
+                        f"{definition} must leave exact assistant identity cleanup to its owning listener",
+                    )
+
+            super_awaits = [node for node in ast.walk(function_node) if self._is_super_interruption_await(node)]
+            task_cleanups = [node for node in ast.walk(function_node) if self._is_owned_task_cleanup(node)]
+            for super_await in super_awaits:
+                for task_cleanup in task_cleanups:
+                    if task_cleanup.lineno <= super_await.lineno:
+                        continue
+                    self.assertTrue(
+                        self._cleanup_is_in_finally_for_await(function_node, task_cleanup, super_await),
+                        f"{definition} must protect post-disconnect task cleanup with finally",
+                    )
 
 
 class _ControllableConnection:

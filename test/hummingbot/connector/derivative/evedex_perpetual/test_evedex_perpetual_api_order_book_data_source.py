@@ -189,6 +189,133 @@ class TestEvedexPerpetualAPIOrderBookDataSource(unittest.IsolatedAsyncioTestCase
         await self.data_source._connected_websocket_assistant()
         self.assertTrue(ping_task.cancelled() or ping_task.done())
 
+    async def _start_listener_with_disconnect(self, disconnect, expect_installed=True):
+        connection_attempts = 0
+
+        async def connected_websocket_assistant():
+            nonlocal connection_attempts
+            connection_attempts += 1
+            if connection_attempts == 1:
+                return self.ws_assistant
+            await asyncio.Future()
+
+        self.ws_assistant.disconnect.side_effect = disconnect
+        self.data_source._connected_websocket_assistant = connected_websocket_assistant
+        self.data_source._subscribe_channels = AsyncMock()
+        self.data_source._process_websocket_messages = AsyncMock()
+        listener_task = asyncio.create_task(self.data_source.listen_for_subscriptions())
+        if expect_installed:
+            for _ in range(20):
+                if self.data_source._ws_assistant is self.ws_assistant:
+                    break
+                await asyncio.sleep(0)
+            self.assertIs(self.ws_assistant, self.data_source._ws_assistant)
+        return listener_task
+
+    async def test_interruption_keeps_exact_assistant_while_disconnect_is_blocked(self):
+        disconnect_started = asyncio.Event()
+        disconnect_release = asyncio.Event()
+
+        async def disconnect():
+            disconnect_started.set()
+            await disconnect_release.wait()
+
+        listener_task = await self._start_listener_with_disconnect(disconnect)
+        await asyncio.wait_for(disconnect_started.wait(), timeout=0.2)
+
+        self.assertIs(self.ws_assistant, self.data_source._ws_assistant)
+
+        disconnect_release.set()
+        for _ in range(20):
+            if self.data_source._ws_assistant is None:
+                break
+            await asyncio.sleep(0)
+        self.assertIsNone(self.data_source._ws_assistant)
+        listener_task.cancel()
+        await asyncio.gather(listener_task, return_exceptions=True)
+
+    async def test_interruption_suppressing_cancellation_keeps_exact_assistant_until_disconnect_returns(self):
+        disconnect_started = asyncio.Event()
+        cancellation_suppressed = asyncio.Event()
+        disconnect_release = asyncio.Event()
+
+        async def disconnect():
+            disconnect_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancellation_suppressed.set()
+                while not disconnect_release.is_set():
+                    try:
+                        await disconnect_release.wait()
+                    except asyncio.CancelledError:
+                        pass
+
+        self.data_source._ws_assistant = self.ws_assistant
+        self.ws_assistant.disconnect.side_effect = disconnect
+        interruption_task = asyncio.create_task(
+            self.data_source._on_order_stream_interruption(self.ws_assistant)
+        )
+        await asyncio.wait_for(disconnect_started.wait(), timeout=0.2)
+        interruption_task.cancel("suppressed disconnect cancellation")
+        await asyncio.wait_for(cancellation_suppressed.wait(), timeout=0.2)
+
+        try:
+            self.assertIs(self.ws_assistant, self.data_source._ws_assistant)
+        finally:
+            disconnect_release.set()
+            await asyncio.gather(interruption_task, return_exceptions=True)
+            self.data_source._ws_assistant = None
+
+    async def test_old_interruption_hook_cannot_clear_replacement_assistant(self):
+        disconnect_started = asyncio.Event()
+        disconnect_release = asyncio.Event()
+
+        async def disconnect():
+            disconnect_started.set()
+            await disconnect_release.wait()
+
+        listener_task = await self._start_listener_with_disconnect(disconnect)
+        await asyncio.wait_for(disconnect_started.wait(), timeout=0.2)
+        replacement_assistant = MagicMock()
+        self.data_source._ws_assistant = replacement_assistant
+
+        disconnect_release.set()
+        await asyncio.sleep(0)
+
+        self.assertIs(replacement_assistant, self.data_source._ws_assistant)
+        listener_task.cancel()
+        await asyncio.gather(listener_task, return_exceptions=True)
+        self.assertIs(replacement_assistant, self.data_source._ws_assistant)
+
+    async def test_interruption_disconnect_error_clears_exact_assistant(self):
+        async def disconnect():
+            raise RuntimeError("disconnect failed")
+
+        listener_task = await self._start_listener_with_disconnect(disconnect, expect_installed=False)
+
+        with self.assertRaisesRegex(RuntimeError, "disconnect failed"):
+            await listener_task
+
+        self.assertIsNone(self.data_source._ws_assistant)
+
+    async def test_interruption_disconnect_cancellation_preserves_args_and_clears_exact_assistant(self):
+        disconnect_started = asyncio.Event()
+
+        async def disconnect():
+            disconnect_started.set()
+            await asyncio.Future()
+
+        listener_task = await self._start_listener_with_disconnect(disconnect)
+        await asyncio.wait_for(disconnect_started.wait(), timeout=0.2)
+        listener_task.cancel("disconnect cancelled")
+
+        with self.assertRaises(asyncio.CancelledError) as cancellation_context:
+            await listener_task
+
+        self.assertEqual(("disconnect cancelled",), cancellation_context.exception.args)
+        self.assertIsNone(self.data_source._ws_assistant)
+
     async def test_ping_loop_sends_and_cancels(self):
         sleep_mock = AsyncMock(side_effect=[None, asyncio.CancelledError])
         with patch("asyncio.sleep", sleep_mock):

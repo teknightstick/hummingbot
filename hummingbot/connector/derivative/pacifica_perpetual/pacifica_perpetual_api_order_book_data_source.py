@@ -231,10 +231,21 @@ class PacificaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             raise
 
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
-        await super()._on_order_stream_interruption(websocket_assistant)
-        if self._ping_task is not None:
-            self._ping_task.cancel()
-            self._ping_task = None
+        ping_task = self._ping_task
+        try:
+            await super()._on_order_stream_interruption(websocket_assistant)
+        finally:
+            if ping_task is not None:
+                try:
+                    ping_task.cancel()
+                    await ping_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    self.logger().exception("Error while cleaning up the Pacifica WebSocket ping task")
+                finally:
+                    if self._ping_task is ping_task:
+                        self._ping_task = None
 
     async def _ping_loop(self, ws: WSAssistant):
         while True:

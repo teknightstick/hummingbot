@@ -84,6 +84,138 @@ class PacificaPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCas
     def _is_logged(self, log_level: str, message: str):
         return any(record.levelname == log_level and message in record.getMessage() for record in self.log_records)
 
+    async def _wait_for_queue_size(self, queue: asyncio.Queue, expected_size: int):
+        for _ in range(20):
+            if queue.qsize() >= expected_size:
+                return
+            await asyncio.sleep(0)
+
+    async def _running_ping(self, started: asyncio.Event, finalized: list):
+        started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            finalized.append("finalized")
+
+    async def test_interruption_cancels_and_drains_exact_ping_task_after_disconnect_returns(self):
+        ping_started = asyncio.Event()
+        finalized = []
+        ping_task = asyncio.create_task(self._running_ping(ping_started, finalized))
+        self.data_source._ping_task = ping_task
+        websocket_assistant = AsyncMock()
+        await ping_started.wait()
+
+        await self.data_source._on_order_stream_interruption(websocket_assistant)
+
+        websocket_assistant.disconnect.assert_awaited_once_with()
+        self.assertTrue(ping_task.cancelled())
+        self.assertEqual(1, ping_task.cancelling())
+        self.assertEqual(["finalized"], finalized)
+        self.assertIsNone(self.data_source._ping_task)
+
+    async def test_interruption_cleans_ping_task_without_replacing_disconnect_error(self):
+        ping_started = asyncio.Event()
+        finalized = []
+        ping_task = asyncio.create_task(self._running_ping(ping_started, finalized))
+        self.data_source._ping_task = ping_task
+        websocket_assistant = AsyncMock()
+        websocket_assistant.disconnect.side_effect = RuntimeError("disconnect failed")
+        await ping_started.wait()
+
+        with self.assertRaisesRegex(RuntimeError, "disconnect failed"):
+            await self.data_source._on_order_stream_interruption(websocket_assistant)
+
+        self.assertTrue(ping_task.cancelled())
+        self.assertEqual(1, ping_task.cancelling())
+        self.assertEqual(["finalized"], finalized)
+        self.assertIsNone(self.data_source._ping_task)
+
+    async def test_interruption_cleans_ping_task_and_preserves_disconnect_cancellation_args(self):
+        ping_started = asyncio.Event()
+        disconnect_started = asyncio.Event()
+        finalized = []
+        ping_task = asyncio.create_task(self._running_ping(ping_started, finalized))
+        self.data_source._ping_task = ping_task
+        websocket_assistant = AsyncMock()
+
+        async def disconnect():
+            disconnect_started.set()
+            await asyncio.Future()
+
+        websocket_assistant.disconnect.side_effect = disconnect
+        await ping_started.wait()
+        interruption_task = asyncio.create_task(
+            self.data_source._on_order_stream_interruption(websocket_assistant)
+        )
+        await disconnect_started.wait()
+        interruption_task.cancel("disconnect cancelled")
+
+        with self.assertRaises(asyncio.CancelledError) as cancellation_context:
+            await interruption_task
+
+        self.assertEqual(("disconnect cancelled",), cancellation_context.exception.args)
+        self.assertTrue(ping_task.cancelled())
+        self.assertEqual(1, ping_task.cancelling())
+        self.assertEqual(["finalized"], finalized)
+        self.assertIsNone(self.data_source._ping_task)
+
+    async def test_old_interruption_hook_cannot_cancel_or_clear_replacement_ping_task(self):
+        old_ping_started = asyncio.Event()
+        disconnect_started = asyncio.Event()
+        disconnect_release = asyncio.Event()
+        old_finalized = []
+        old_ping_task = asyncio.create_task(self._running_ping(old_ping_started, old_finalized))
+        self.data_source._ping_task = old_ping_task
+        websocket_assistant = AsyncMock()
+
+        async def disconnect():
+            disconnect_started.set()
+            await disconnect_release.wait()
+
+        websocket_assistant.disconnect.side_effect = disconnect
+        await old_ping_started.wait()
+        interruption_task = asyncio.create_task(
+            self.data_source._on_order_stream_interruption(websocket_assistant)
+        )
+        await disconnect_started.wait()
+        replacement_ping_task = asyncio.create_task(asyncio.sleep(10))
+        self.data_source._ping_task = replacement_ping_task
+
+        disconnect_release.set()
+        await interruption_task
+
+        self.assertTrue(old_ping_task.cancelled())
+        self.assertEqual(1, old_ping_task.cancelling())
+        self.assertEqual(["finalized"], old_finalized)
+        self.assertIs(replacement_ping_task, self.data_source._ping_task)
+        self.assertFalse(replacement_ping_task.done())
+        replacement_ping_task.cancel()
+        await asyncio.gather(replacement_ping_task, return_exceptions=True)
+
+    async def test_ping_cleanup_failure_is_retrieved_and_cannot_replace_disconnect_error(self):
+        ping_started = asyncio.Event()
+
+        async def failing_ping_cleanup():
+            ping_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                raise ValueError("ping cleanup failed")
+
+        ping_task = asyncio.create_task(failing_ping_cleanup())
+        self.data_source._ping_task = ping_task
+        websocket_assistant = AsyncMock()
+        websocket_assistant.disconnect.side_effect = RuntimeError("disconnect failed")
+        await ping_started.wait()
+
+        with self.assertRaisesRegex(RuntimeError, "disconnect failed"):
+            await self.data_source._on_order_stream_interruption(websocket_assistant)
+
+        self.assertTrue(ping_task.done())
+        self.assertIsInstance(ping_task.exception(), ValueError)
+        self.assertTrue(self._is_logged("ERROR", "Error while cleaning up the Pacifica WebSocket ping task"))
+        self.assertIsNone(self.data_source._ping_task)
+
     def get_rest_snapshot_msg(self):
         """Mock REST order book snapshot response"""
         return {
@@ -272,6 +404,7 @@ class PacificaPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCas
 
         await self.mocking_assistant.run_until_all_aiohttp_messages_delivered(ws_connect_mock.return_value)
 
+        await self._wait_for_queue_size(message_queue, 1)
         self.assertEqual(1, message_queue.qsize())
         trade_message = message_queue.get_nowait()
 
@@ -300,6 +433,7 @@ class PacificaPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCas
 
         await self.mocking_assistant.run_until_all_aiohttp_messages_delivered(ws_connect_mock.return_value)
 
+        await self._wait_for_queue_size(message_queue, 1)
         self.assertEqual(1, message_queue.qsize())
         snapshot_message = message_queue.get_nowait()
 
@@ -327,6 +461,7 @@ class PacificaPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCas
 
         await self.mocking_assistant.run_until_all_aiohttp_messages_delivered(ws_connect_mock.return_value)
 
+        await self._wait_for_queue_size(message_queue, 1)
         self.assertGreater(message_queue.qsize(), 0)
 
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
