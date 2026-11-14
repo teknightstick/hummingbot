@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 
 from hummingbot.connector.exchange_py_base import ExchangePyBase, NetworkLifecycleError
+from hummingbot.core.data_type.order_book_tracker import OrderBookTracker
 
 
 class _LifecycleHarnessBase(ExchangePyBase):
@@ -176,15 +177,19 @@ class ExchangePyBaseTrackerLifecycleTests(IsolatedAsyncioWrapperTestCase):
         connector._set_order_book_tracker(order_book_tracker)
         return connector
 
-    async def test_stop_network_awaits_order_book_tracker_drain(self):
-        order_book_tracker = MagicMock()
-        order_book_tracker.stop_and_wait = AsyncMock(return_value=True)
-        connector = self._connector(order_book_tracker)
+    async def test_stop_network_stops_real_order_book_tracker_exactly_once_before_drain(self):
+        tracker = OrderBookTracker(data_source=MagicMock(), trading_pairs=[])
+        connector = self._connector(tracker)
+        stop = MagicMock(wraps=tracker.stop)
+        drain_stopped_tasks = AsyncMock(wraps=OrderBookTracker._drain_stopped_tasks)
+        tracker.stop = stop
 
-        result = await ExchangePyBase.stop_network(connector)
+        with patch.object(OrderBookTracker, "_drain_stopped_tasks", drain_stopped_tasks):
+            result = await ExchangePyBase.stop_network(connector)
 
-        order_book_tracker.stop_and_wait.assert_awaited_once_with()
         self.assertIsNone(result)
+        stop.assert_called_once_with()
+        drain_stopped_tasks.assert_awaited_once_with(tracker)
         self.assertEqual(set(), connector._network_tasks_to_drain)
 
     async def test_cancelled_queued_stop_does_not_allocate_or_invalidate_generation(self):

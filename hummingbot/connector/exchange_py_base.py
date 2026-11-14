@@ -1079,7 +1079,18 @@ class ExchangePyBase(ExchangeBase, ABC):
                 self._poll_notifier = asyncio.Event()
                 self.order_book_tracker.stop()
 
-                tracker_drain_task = asyncio.ensure_future(self.order_book_tracker.stop_and_wait())
+                tracker_drain_method = getattr(
+                    type(self.order_book_tracker),
+                    "_drain_stopped_tasks",
+                    None,
+                )
+                if tracker_drain_method is None:
+                    # Preserve compatibility with legacy tracker doubles that
+                    # expose only the original public stop-and-wait shape.
+                    tracker_drain = self.order_book_tracker.stop_and_wait()
+                else:
+                    tracker_drain = tracker_drain_method(self.order_book_tracker)
+                tracker_drain_task = asyncio.ensure_future(tracker_drain)
                 cleanup_tasks.append(tracker_drain_task)
                 ExchangePyBase._track_network_task(self, tracker_drain_task)
 

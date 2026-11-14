@@ -594,6 +594,10 @@ class OrderBookTracker:
     async def stop_and_wait(self, timeout: float = 10.0) -> bool:
         """Stop immediately, then wait up to ``timeout`` seconds for owned tasks to drain."""
         self.stop()
+        return await self._drain_stopped_tasks(timeout)
+
+    async def _drain_stopped_tasks(self, timeout: float = 10.0) -> bool:
+        """Drain an already-stopped tracker; the caller must own the preceding ``stop()``."""
         deadline = self._ev_loop.time() + timeout
         while self._tasks_to_drain:
             for task in tuple(self._tasks_to_drain):

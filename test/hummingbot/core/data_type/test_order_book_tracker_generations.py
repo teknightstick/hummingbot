@@ -287,6 +287,8 @@ class OrderBookTrackerGenerationTests(IsolatedAsyncioWrapperTestCase):
         tracker = OrderBookTracker(
             data_source=MagicMock(spec=OrderBookTrackerDataSource), trading_pairs=[]
         )
+        stop = MagicMock(wraps=tracker.stop)
+        tracker.stop = stop
         generation_task = asyncio.create_task(cancellation_resistant_task())
         await asyncio.sleep(0)
         tracker._tracking_tasks["OLD-USDT"] = generation_task
@@ -299,6 +301,7 @@ class OrderBookTrackerGenerationTests(IsolatedAsyncioWrapperTestCase):
             cleanup_release.set()
             self.assertTrue(await drain_task)
             self.assertTrue(generation_task.done())
+            stop.assert_called_once_with()
         finally:
             cleanup_release.set()
             generation_task.cancel()
