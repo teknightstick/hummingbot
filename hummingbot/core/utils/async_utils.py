@@ -29,6 +29,7 @@ class GenerationOwnedTaskOwner:
         self._residual_tasks: Set[asyncio.Task] = set()
         self._cancellation_requested_tasks: weakref.WeakSet = weakref.WeakSet()
         self._handled_tasks: weakref.WeakSet = weakref.WeakSet()
+        self._end_requested_generation_ids: Set[int] = set()
 
     @property
     def current_task(self) -> Optional[asyncio.Task]:
@@ -74,8 +75,13 @@ class GenerationOwnedTaskOwner:
     def end_generation(self, generation: object):
         if self._current_generation is not generation:
             return
-        if self._current_task is None or self._current_task.done():
-            self._current_generation = None
+        generation_id = id(generation)
+        generation_task = self.task_for(generation)
+        if generation_task is not None and not generation_task.done():
+            self._end_requested_generation_ids.add(generation_id)
+            return
+        self._current_generation = None
+        self._end_requested_generation_ids.discard(generation_id)
 
     async def wait_until_released(self):
         while True:
@@ -136,17 +142,25 @@ class GenerationOwnedTaskOwner:
         self._finalize_task(task)
 
     def _finalize_task(self, task: asyncio.Task):
-        self._residual_tasks.discard(task)
-        for generation_id, (_, generation_task) in list(self._tasks_by_generation.items()):
-            if generation_task is task:
-                self._tasks_by_generation.pop(generation_id, None)
-        if self._current_task is task:
-            self._current_task = None
-        self._on_task_done(task)
-
         if task in self._handled_tasks:
             return
         self._handled_tasks.add(task)
+
+        self._residual_tasks.discard(task)
+        finalized_generations = []
+        for generation_id, (generation, generation_task) in list(self._tasks_by_generation.items()):
+            if generation_task is task:
+                self._tasks_by_generation.pop(generation_id, None)
+                finalized_generations.append((generation_id, generation))
+        if self._current_task is task:
+            self._current_task = None
+        for generation_id, generation in finalized_generations:
+            if generation_id in self._end_requested_generation_ids:
+                self._end_requested_generation_ids.discard(generation_id)
+                if self._current_generation is generation and self.task_for(generation) is None:
+                    self._current_generation = None
+        self._on_task_done(task)
+
         if task.cancelled():
             return
         try:

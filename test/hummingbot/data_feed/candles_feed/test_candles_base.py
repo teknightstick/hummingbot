@@ -1,8 +1,10 @@
 import asyncio
+import gc
 import json
 import os
 import re
 import time
+import weakref
 from abc import ABC
 from collections import deque
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
@@ -14,6 +16,11 @@ from aioresponses import aioresponses
 
 from hummingbot.connector.test_support.network_mocking_assistant import NetworkMockingAssistant
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
+
+
+class _WeakrefableWebsocket:
+    async def disconnect(self):
+        return None
 
 
 class _InterruptionTestCandles(CandlesBase):
@@ -362,6 +369,40 @@ class TestCandlesBaseInterruption(IsolatedAsyncioWrapperTestCase):
         finally:
             release.set()
             await asyncio.gather(fill_task, interruption_task, return_exceptions=True)
+
+    async def test_completed_residual_releases_websocket_generation_for_collection(self):
+        fill_started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+        fill_task = asyncio.create_task(
+            self._cancellation_suppressing_fill(fill_started, cancellation_seen, release, [])
+        )
+        websocket_assistant = _WeakrefableWebsocket()
+        websocket_ref = weakref.ref(websocket_assistant)
+        self._bind_fill_task(websocket_assistant, fill_task)
+        await fill_started.wait()
+
+        with patch.object(type(self.data_feed), "_FILL_CANDLES_TASK_CLEANUP_TIMEOUT", 0.01):
+            await self.data_feed._on_order_stream_interruption(websocket_assistant)
+        await cancellation_seen.wait()
+
+        self.assertIs(websocket_assistant, self.data_feed._fill_candles_task_owner._current_generation)
+        websocket_assistant = None
+        gc.collect()
+        self.assertIsNotNone(websocket_ref())
+
+        release.set()
+        await fill_task
+        await asyncio.sleep(0)
+        for _ in range(3):
+            gc.collect()
+            await asyncio.sleep(0)
+
+        self.assertIsNone(websocket_ref())
+        self.assertIsNone(self.data_feed._fill_candles_task_owner._current_generation)
+        self.assertIsNone(self.data_feed._fill_candles_task)
+        self.assertEqual({}, self.data_feed._fill_candles_task_owner._tasks_by_generation)
+        self.assertEqual(set(), self.data_feed._residual_fill_candles_tasks)
 
     async def test_owner_cancellation_during_fill_cleanup_is_bounded_and_preserved(self):
         started = asyncio.Event()

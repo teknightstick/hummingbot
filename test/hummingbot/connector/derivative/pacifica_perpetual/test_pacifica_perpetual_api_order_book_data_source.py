@@ -1,6 +1,8 @@
 import asyncio
+import gc
 import json
 import re
+import weakref
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,6 +22,11 @@ from hummingbot.core.web_assistant.connections.rest_connection import RESTConnec
 from hummingbot.core.web_assistant.connections.ws_connection import WSConnection
 from hummingbot.core.web_assistant.rest_assistant import RESTAssistant
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
+
+
+class _WeakrefableWebsocket:
+    async def disconnect(self):
+        return None
 
 
 class PacificaPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
@@ -398,6 +405,40 @@ class PacificaPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCas
         finally:
             release.set()
             await asyncio.gather(ping_task, interruption_task, return_exceptions=True)
+
+    async def test_completed_residual_releases_websocket_generation_for_collection(self):
+        ping_started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+        ping_task = asyncio.create_task(
+            self._cancellation_suppressing_ping(ping_started, cancellation_seen, release, [])
+        )
+        websocket_assistant = _WeakrefableWebsocket()
+        websocket_ref = weakref.ref(websocket_assistant)
+        self._bind_ping_task(websocket_assistant, ping_task)
+        await ping_started.wait()
+
+        with patch.object(type(self.data_source), "_PING_TASK_CLEANUP_TIMEOUT", 0.01):
+            await self.data_source._on_order_stream_interruption(websocket_assistant)
+        await cancellation_seen.wait()
+
+        self.assertIs(websocket_assistant, self.data_source._ping_task_owner._current_generation)
+        websocket_assistant = None
+        gc.collect()
+        self.assertIsNotNone(websocket_ref())
+
+        release.set()
+        await ping_task
+        await asyncio.sleep(0)
+        for _ in range(3):
+            gc.collect()
+            await asyncio.sleep(0)
+
+        self.assertIsNone(websocket_ref())
+        self.assertIsNone(self.data_source._ping_task_owner._current_generation)
+        self.assertIsNone(self.data_source._ping_task)
+        self.assertEqual({}, self.data_source._ping_task_owner._tasks_by_generation)
+        self.assertEqual(set(), self.data_source._residual_ping_tasks)
 
     async def test_owner_cancellation_during_ping_cleanup_is_bounded_and_preserved(self):
         ping_started = asyncio.Event()
