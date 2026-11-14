@@ -28,6 +28,7 @@ class CandlesBase(NetworkBase):
     Also implements the Throttler module for API rate limiting, but it's not so necessary since the realtime data should
     be updated via websockets mainly.
     """
+    _FILL_CANDLES_TASK_CLEANUP_TIMEOUT = 1.0
     interval_to_seconds = bidict({
         "1s": 1,
         "1m": 60,
@@ -57,6 +58,7 @@ class CandlesBase(NetworkBase):
         self._candles = deque(maxlen=max_records)
         self._listen_candles_task: Optional[asyncio.Task] = None
         self._fill_candles_task: Optional[asyncio.Task] = None
+        self._residual_fill_candles_tasks = set()
         self._trading_pair = trading_pair
         # Optional reference to the backing connector (same exchange). When present, the feed reuses
         # the connector's public symbol map and cached exchange-data instead of fetching them itself.
@@ -561,12 +563,61 @@ class CandlesBase(NetworkBase):
         await asyncio.sleep(delay)
 
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
-        websocket_assistant and await websocket_assistant.disconnect()
-        if self._fill_candles_task is not None:
-            self._fill_candles_task.cancel()
+        fill_candles_task = self._fill_candles_task
+        try:
+            websocket_assistant and await websocket_assistant.disconnect()
+        finally:
+            try:
+                if fill_candles_task is not None:
+                    await self._cleanup_fill_candles_task(fill_candles_task)
+            finally:
+                self._ws_candle_available.clear()
+                self._candles.clear()
+
+    def _fill_candles_task_done(self, fill_candles_task: asyncio.Task):
+        self._residual_fill_candles_tasks.discard(fill_candles_task)
+        if self._fill_candles_task is fill_candles_task:
             self._fill_candles_task = None
-        self._ws_candle_available.clear()
-        self._candles.clear()
+        if fill_candles_task.cancelled():
+            return
+        try:
+            exception = fill_candles_task.exception()
+        except asyncio.CancelledError:
+            return
+        if exception is not None:
+            self.logger().error(
+                "Error while cleaning up the fill candles task",
+                exc_info=(type(exception), exception, exception.__traceback__),
+            )
+
+    async def _cleanup_fill_candles_task(self, fill_candles_task: asyncio.Task):
+        if not fill_candles_task.done() and fill_candles_task not in self._residual_fill_candles_tasks:
+            fill_candles_task.cancel()
+
+        owner_cancellation = None
+        deadline = asyncio.get_running_loop().time() + self._FILL_CANDLES_TASK_CLEANUP_TIMEOUT
+        while not fill_candles_task.done():
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait({fill_candles_task}, timeout=remaining)
+            except asyncio.CancelledError as cancellation:
+                if owner_cancellation is None:
+                    owner_cancellation = cancellation
+
+        if fill_candles_task.done():
+            self._fill_candles_task_done(fill_candles_task)
+        else:
+            if fill_candles_task not in self._residual_fill_candles_tasks:
+                self._residual_fill_candles_tasks.add(fill_candles_task)
+                fill_candles_task.add_done_callback(self._fill_candles_task_done)
+            self.logger().warning(
+                "The fill candles task did not stop before the cleanup deadline; retaining residual ownership."
+            )
+
+        if owner_cancellation is not None:
+            raise owner_cancellation
 
     def get_seconds_from_interval(self, interval: str) -> int:
         """

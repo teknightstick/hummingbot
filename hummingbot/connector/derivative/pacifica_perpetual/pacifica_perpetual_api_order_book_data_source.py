@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
 class PacificaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
     _logger: Optional[HummingbotLogger] = None
+    _PING_TASK_CLEANUP_TIMEOUT = 1.0
 
     def __init__(
         self,
@@ -38,6 +39,7 @@ class PacificaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         self._api_factory = api_factory
         self._domain = domain
         self._ping_task: Optional[asyncio.Task] = None
+        self._residual_ping_tasks = set()
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
@@ -236,16 +238,52 @@ class PacificaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             await super()._on_order_stream_interruption(websocket_assistant)
         finally:
             if ping_task is not None:
-                try:
-                    ping_task.cancel()
-                    await ping_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    self.logger().exception("Error while cleaning up the Pacifica WebSocket ping task")
-                finally:
-                    if self._ping_task is ping_task:
-                        self._ping_task = None
+                await self._cleanup_ping_task(ping_task)
+
+    def _ping_task_done(self, ping_task: asyncio.Task):
+        self._residual_ping_tasks.discard(ping_task)
+        if self._ping_task is ping_task:
+            self._ping_task = None
+        if ping_task.cancelled():
+            return
+        try:
+            exception = ping_task.exception()
+        except asyncio.CancelledError:
+            return
+        if exception is not None:
+            self.logger().error(
+                "Error while cleaning up the Pacifica WebSocket ping task",
+                exc_info=(type(exception), exception, exception.__traceback__),
+            )
+
+    async def _cleanup_ping_task(self, ping_task: asyncio.Task):
+        if not ping_task.done() and ping_task not in self._residual_ping_tasks:
+            ping_task.cancel()
+
+        owner_cancellation = None
+        deadline = asyncio.get_running_loop().time() + self._PING_TASK_CLEANUP_TIMEOUT
+        while not ping_task.done():
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait({ping_task}, timeout=remaining)
+            except asyncio.CancelledError as cancellation:
+                if owner_cancellation is None:
+                    owner_cancellation = cancellation
+
+        if ping_task.done():
+            self._ping_task_done(ping_task)
+        else:
+            if ping_task not in self._residual_ping_tasks:
+                self._residual_ping_tasks.add(ping_task)
+                ping_task.add_done_callback(self._ping_task_done)
+            self.logger().warning(
+                "Pacifica WebSocket ping task did not stop before the cleanup deadline; retaining residual ownership."
+            )
+
+        if owner_cancellation is not None:
+            raise owner_cancellation
 
     async def _ping_loop(self, ws: WSAssistant):
         while True:

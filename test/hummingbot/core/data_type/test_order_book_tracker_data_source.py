@@ -103,16 +103,13 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         return None
 
     @staticmethod
-    def _is_super_interruption_await(node):
+    def _is_disconnect_boundary_await(node):
         if not isinstance(node, ast.Await) or not isinstance(node.value, ast.Call):
             return False
         function = node.value.func
         return (
             isinstance(function, ast.Attribute)
-            and function.attr == "_on_order_stream_interruption"
-            and isinstance(function.value, ast.Call)
-            and isinstance(function.value.func, ast.Name)
-            and function.value.func.id == "super"
+            and function.attr in {"_on_order_stream_interruption", "disconnect"}
         )
 
     @classmethod
@@ -129,6 +126,8 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 and task.value.id == "self"
                 and task.attr.endswith("_task")
             )
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            return node.func.attr in {"_cleanup_ping_task", "_cleanup_fill_candles_task"}
         return False
 
     @staticmethod
@@ -149,9 +148,9 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         self.assertEqual(EXPECTED_ORDER_STREAM_DEFINITIONS, set(definitions))
         self.assertEqual(25, len(definitions))
 
+        audited_definitions = set()
         for definition, function_node in definitions.items():
-            if function_node.name != "_on_order_stream_interruption":
-                continue
+            audited_definitions.add(definition)
             for node in ast.walk(function_node):
                 if isinstance(node, (ast.Assign, ast.AnnAssign)):
                     assigned_attribute = self._assigned_self_attribute(node)
@@ -161,20 +160,23 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                         and node.value.value is None
                     )
                     self.assertFalse(
-                        clears_assistant,
+                        function_node.name == "_on_order_stream_interruption" and clears_assistant,
                         f"{definition} must leave exact assistant identity cleanup to its owning listener",
                     )
 
-            super_awaits = [node for node in ast.walk(function_node) if self._is_super_interruption_await(node)]
+            disconnect_awaits = [
+                node for node in ast.walk(function_node) if self._is_disconnect_boundary_await(node)
+            ]
             task_cleanups = [node for node in ast.walk(function_node) if self._is_owned_task_cleanup(node)]
-            for super_await in super_awaits:
+            for disconnect_await in disconnect_awaits:
                 for task_cleanup in task_cleanups:
-                    if task_cleanup.lineno <= super_await.lineno:
+                    if task_cleanup.lineno <= disconnect_await.lineno:
                         continue
                     self.assertTrue(
-                        self._cleanup_is_in_finally_for_await(function_node, task_cleanup, super_await),
+                        self._cleanup_is_in_finally_for_await(function_node, task_cleanup, disconnect_await),
                         f"{definition} must protect post-disconnect task cleanup with finally",
                     )
+        self.assertEqual(EXPECTED_ORDER_STREAM_DEFINITIONS, audited_definitions)
 
 
 class _ControllableConnection:
