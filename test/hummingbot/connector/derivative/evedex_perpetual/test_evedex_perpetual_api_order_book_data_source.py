@@ -205,6 +205,46 @@ class TestEvedexPerpetualAPIOrderBookDataSource(unittest.IsolatedAsyncioTestCase
         self.assertIsNone(self.data_source._ping_task)
         self.assertEqual(set(), self.data_source._residual_ping_tasks)
 
+    async def test_connected_websocket_assistant_waits_for_residual_ping_release_before_reconnect(self):
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+        ping_task = asyncio.create_task(
+            self._cancellation_suppressing_ping(started, cancellation_seen, release)
+        )
+        self.data_source._ping_task = ping_task
+        await started.wait()
+
+        reconnect_task = None
+        try:
+            with patch.object(type(self.data_source), "_PING_TASK_CLEANUP_TIMEOUT", 0.01):
+                reconnect_task = asyncio.create_task(self.data_source._connected_websocket_assistant())
+                await cancellation_seen.wait()
+                await asyncio.sleep(0.02)
+
+            self.assertFalse(reconnect_task.done())
+            self.api_factory.get_ws_assistant.assert_not_awaited()
+
+            release.set()
+            await asyncio.wait_for(reconnect_task, timeout=0.2)
+            self.api_factory.get_ws_assistant.assert_awaited_once_with()
+        finally:
+            release.set()
+            if reconnect_task is not None and not reconnect_task.done():
+                reconnect_task.cancel()
+            await asyncio.gather(ping_task, reconnect_task, return_exceptions=True)
+
+    async def test_connected_websocket_assistant_disconnects_exact_assistant_on_handshake_failure(self):
+        handshake_error = RuntimeError("handshake failed")
+        self.ws_assistant.send.side_effect = handshake_error
+
+        with self.assertRaises(RuntimeError) as error_context:
+            await self.data_source._connected_websocket_assistant()
+
+        self.assertIs(handshake_error, error_context.exception)
+        self.ws_assistant.disconnect.assert_awaited_once_with()
+        self.assertIsNone(self.data_source._ws_assistant)
+
     async def test_interruption_distinguishes_child_ping_cancellation_from_owner_cancellation(self):
         ping_task = asyncio.create_task(asyncio.sleep(10))
         self.data_source._ping_task = ping_task

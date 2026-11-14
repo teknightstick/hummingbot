@@ -6,7 +6,7 @@ from typing import List, Optional
 from dateutil.parser import parse as dateparse
 
 from hummingbot.core.network_iterator import NetworkStatus
-from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.core.utils.async_utils import await_primary_then_cleanup, safe_ensure_future
 from hummingbot.data_feed.candles_feed.btc_markets_spot_candles import constants as CONSTANTS
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.logger import HummingbotLogger
@@ -37,6 +37,7 @@ class BtcMarketsSpotCandles(CandlesBase):
 
         # Task management for polling
         self._polling_task: Optional[asyncio.Task] = None
+        self._polling_generation: Optional[object] = None
         self._shutdown_event = asyncio.Event()
         self._is_running = False
 
@@ -99,31 +100,58 @@ class BtcMarketsSpotCandles(CandlesBase):
         """
         await self.stop_network()
         await self.initialize_exchange_data()
+        await self._fill_candles_task_owner.wait_until_released()
+        generation = object()
+        self._start_candle_generation(generation)
+        self._polling_generation = generation
         self._is_running = True
         self._shutdown_event.clear()
-        self._polling_task = asyncio.create_task(self._polling_loop())
+        try:
+            self._polling_task = asyncio.create_task(self._polling_loop(generation))
+        except BaseException:
+            await self._on_candle_generation_interruption(generation)
+            self._polling_generation = None
+            self._is_running = False
+            raise
 
     async def stop_network(self):
         """
         Stop the network by gracefully shutting down the polling task.
         """
-        if self._polling_task and not self._polling_task.done():
+        polling_task = self._polling_task
+        generation = self._polling_generation
+
+        async def stop_polling():
+            if polling_task is None or polling_task.done():
+                return
             self._is_running = False
             self._shutdown_event.set()
 
             try:
                 # Wait for graceful shutdown
-                await asyncio.wait_for(self._polling_task, timeout=10.0)
+                await asyncio.wait_for(polling_task, timeout=10.0)
             except asyncio.TimeoutError:
                 self.logger().warning("Polling task didn't stop gracefully, cancelling...")
-                self._polling_task.cancel()
+                polling_task.cancel()
                 try:
-                    await self._polling_task
+                    await polling_task
                 except asyncio.CancelledError:
                     pass
 
-        self._polling_task = None
-        self._is_running = False
+        try:
+            await await_primary_then_cleanup(
+                primary=stop_polling(),
+                cleanup=(lambda: self._on_candle_generation_interruption(generation))
+                if generation is not None else None,
+                logger=self.logger(),
+                cleanup_error_message="Error while stopping the BTC Markets candle generation",
+            )
+        finally:
+            if self._polling_task is polling_task:
+                self._polling_task = None
+            if self._polling_generation is generation:
+                self._polling_generation = None
+            self._is_running = False
 
     async def check_network(self) -> NetworkStatus:
         rest_assistant = await self._api_factory.get_rest_assistant()
@@ -401,7 +429,7 @@ class BtcMarketsSpotCandles(CandlesBase):
             self.logger().error(f"Error fetching recent candles: {e}")
             return []
 
-    async def _polling_loop(self):
+    async def _polling_loop(self, generation: Optional[object] = None):
         """
         Main polling loop - separated from listen_for_subscriptions for better testability.
         This method can be cancelled cleanly and tested independently.
@@ -410,12 +438,13 @@ class BtcMarketsSpotCandles(CandlesBase):
             self.logger().info(f"Starting constant polling for {self._trading_pair} candles")
 
             # Initial setup
-            await self._initialize_candles()
+            generation = generation if generation is not None else self._polling_generation
+            await self._initialize_candles(generation)
 
             while self._is_running and not self._shutdown_event.is_set():
                 try:
                     # Poll for updates
-                    await self._poll_and_update_candles()
+                    await self._poll_and_update_candles(generation)
 
                     # Ensure heartbeats up to current time
                     self._ensure_heartbeats_to_current_time()
@@ -457,8 +486,7 @@ class BtcMarketsSpotCandles(CandlesBase):
         Legacy method for compatibility with base class.
         Now just delegates to the task-based approach.
         """
-        if not self._is_running:
-            await self.start_network()
+        await self.start_network()
 
         # Wait for the polling task to complete
         if self._polling_task:
@@ -468,7 +496,7 @@ class BtcMarketsSpotCandles(CandlesBase):
                 self.logger().info("Listen for subscriptions cancelled")
                 raise
 
-    async def _poll_and_update_candles(self):
+    async def _poll_and_update_candles(self, generation: Optional[object] = None):
         """
         Fetch recent candles and update data structure.
         This method is now easily testable in isolation.
@@ -489,7 +517,12 @@ class BtcMarketsSpotCandles(CandlesBase):
                 # First initialization
                 self._candles.append(latest_candle)
                 self._ws_candle_available.set()
-                safe_ensure_future(self.fill_historical_candles())
+                generation = generation if generation is not None else self._polling_generation
+                if generation is not None:
+                    self._create_fill_candles_task(
+                        generation,
+                        lambda: safe_ensure_future(self.fill_historical_candles()),
+                    )
                 return
 
             # Simple logic: append if newer, update if same timestamp
@@ -515,7 +548,7 @@ class BtcMarketsSpotCandles(CandlesBase):
             self.logger().error(f"Error during polling: {e}")
             self._consecutive_empty_responses += 1
 
-    async def _initialize_candles(self):
+    async def _initialize_candles(self, generation: Optional[object] = None):
         """Initialize with recent candle data and start constant polling."""
         try:
             self.logger().info("Initializing candles with recent data...")
@@ -526,7 +559,12 @@ class BtcMarketsSpotCandles(CandlesBase):
                 latest_candle = candles[-1]
                 self._candles.append(latest_candle)
                 self._ws_candle_available.set()
-                safe_ensure_future(self.fill_historical_candles())
+                generation = generation if generation is not None else self._polling_generation
+                if generation is not None:
+                    self._create_fill_candles_task(
+                        generation,
+                        lambda: safe_ensure_future(self.fill_historical_candles()),
+                    )
                 self.logger().info(f"Initialized with candle at {latest_candle[0]}")
             else:
                 self.logger().warning("No recent candles found during initialization")

@@ -462,3 +462,33 @@ class GenerationOwnedTaskOwnerTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(("primary cancellation",), cancellation_context.exception.args)
         logged_error = logger.error.call_args.kwargs["exc_info"][1]
         self.assertIs(cleanup_error, logged_error)
+
+    async def test_cleanup_cancellation_wins_over_completed_ordinary_primary_failure(self):
+        logger = MagicMock()
+        primary_error = RuntimeError("primary failed")
+        cleanup_started = asyncio.Event()
+
+        async def primary():
+            raise primary_error
+
+        async def cleanup():
+            cleanup_started.set()
+            await asyncio.Future()
+
+        owner_task = asyncio.create_task(
+            await_primary_then_cleanup(
+                primary=primary(),
+                cleanup=cleanup,
+                logger=logger,
+                cleanup_error_message="cleanup cancelled",
+            )
+        )
+        await cleanup_started.wait()
+        owner_task.cancel("shutdown")
+
+        with self.assertRaises(asyncio.CancelledError) as cancellation_context:
+            await owner_task
+
+        self.assertTrue(owner_task.cancelled())
+        expected_args = ("shutdown",) if sys.version_info >= (3, 11) else ()
+        self.assertEqual(expected_args, cancellation_context.exception.args)

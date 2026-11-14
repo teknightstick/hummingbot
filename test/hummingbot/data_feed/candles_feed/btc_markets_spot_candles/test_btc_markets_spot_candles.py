@@ -689,17 +689,22 @@ class TestBtcMarketsSpotCandles(TestCandlesBase):
 
     async def test_poll_and_update_candles_first_candle(self):
         """Test adding first candle during polling"""
+        generation = object()
+        self.data_feed._start_candle_generation(generation)
         with patch.object(self.data_feed, "fetch_recent_candles", new_callable=AsyncMock) as mock_fetch:
             mock_fetch.return_value = [self.get_fetch_candles_data_mock()[0]]
 
             with patch.object(self.data_feed, "fill_historical_candles", new_callable=AsyncMock) as mock_fill:
-                await self.data_feed._poll_and_update_candles()
+                try:
+                    await self.data_feed._poll_and_update_candles(generation)
 
-                self.assertEqual(len(self.data_feed._candles), 1)
-                self.assertTrue(self.data_feed._ws_candle_available.is_set())
-                # Check that fill_historical_candles was scheduled
-                await asyncio.sleep(0.1)
-                mock_fill.assert_called_once()
+                    self.assertEqual(len(self.data_feed._candles), 1)
+                    self.assertTrue(self.data_feed._ws_candle_available.is_set())
+                    # Check that fill_historical_candles was scheduled
+                    await asyncio.sleep(0.1)
+                    mock_fill.assert_called_once()
+                finally:
+                    await self.data_feed._on_candle_generation_interruption(generation)
 
     async def test_poll_and_update_candles_new_candle(self):
         """Test adding new candle during polling"""
@@ -743,16 +748,21 @@ class TestBtcMarketsSpotCandles(TestCandlesBase):
 
     async def test_initialize_candles_success(self):
         """Test successful candle initialization"""
+        generation = object()
+        self.data_feed._start_candle_generation(generation)
         with patch.object(self.data_feed, "fetch_recent_candles", new_callable=AsyncMock) as mock_fetch:
             mock_fetch.return_value = self.get_fetch_candles_data_mock()[:2]
 
             with patch.object(self.data_feed, "fill_historical_candles", new_callable=AsyncMock) as mock_fill:
-                await self.data_feed._initialize_candles()
+                try:
+                    await self.data_feed._initialize_candles(generation)
 
-                self.assertEqual(len(self.data_feed._candles), 1)
-                self.assertTrue(self.data_feed._ws_candle_available.is_set())
-                await asyncio.sleep(0.1)
-                mock_fill.assert_called_once()
+                    self.assertEqual(len(self.data_feed._candles), 1)
+                    self.assertTrue(self.data_feed._ws_candle_available.is_set())
+                    await asyncio.sleep(0.1)
+                    mock_fill.assert_called_once()
+                finally:
+                    await self.data_feed._on_candle_generation_interruption(generation)
 
     async def test_initialize_candles_no_data(self):
         """Test candle initialization with no data"""
@@ -787,6 +797,59 @@ class TestBtcMarketsSpotCandles(TestCandlesBase):
             await self.data_feed.stop_network()
             self.assertFalse(self.data_feed._is_running)
             self.assertTrue(self.data_feed._polling_task is None or self.data_feed._polling_task.done())
+
+    async def test_restart_waits_for_residual_fill_release(self):
+        old_generation = object()
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+
+        async def cancellation_suppressing_fill():
+            started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+
+        fill_task = asyncio.create_task(cancellation_suppressing_fill())
+        self.data_feed._start_candle_generation(old_generation)
+        self.data_feed._create_fill_candles_task(old_generation, lambda: fill_task)
+        self.data_feed._polling_generation = old_generation
+        await started.wait()
+
+        restart_task = None
+        try:
+            with patch.object(type(self.data_feed), "_FILL_CANDLES_TASK_CLEANUP_TIMEOUT", 0.01):
+                await self.data_feed.stop_network()
+                await cancellation_seen.wait()
+
+                with patch.object(
+                    self.data_feed,
+                    "initialize_exchange_data",
+                    new=AsyncMock(),
+                ), patch.object(
+                    self.data_feed,
+                    "_polling_loop",
+                    new=AsyncMock(return_value=None),
+                ):
+                    restart_task = asyncio.create_task(self.data_feed.start_network())
+                    await asyncio.sleep(0)
+                    self.assertFalse(restart_task.done())
+                    self.assertIsNone(self.data_feed._polling_task)
+
+                    release.set()
+                    await fill_task
+                    await restart_task
+                    self.assertIsNot(old_generation, self.data_feed._polling_generation)
+                    self.assertIsNotNone(self.data_feed._polling_task)
+        finally:
+            release.set()
+            await asyncio.gather(fill_task, return_exceptions=True)
+            if restart_task is not None and not restart_task.done():
+                restart_task.cancel()
+                await asyncio.gather(restart_task, return_exceptions=True)
+            await self.data_feed.stop_network()
 
     async def test_stop_network_timeout(self):
         """Test stop_network with timeout scenario"""

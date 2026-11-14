@@ -487,7 +487,12 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
         return [self._snapshot_messages_queue_key, self._diff_messages_queue_key, self._trade_messages_queue_key]
 
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
-        websocket_assistant and await websocket_assistant.disconnect()
+        await await_primary_then_cleanup(
+            primary=websocket_assistant.disconnect() if websocket_assistant is not None else None,
+            cleanup=None,
+            logger=self.logger(),
+            cleanup_error_message="Error while interrupting the order book stream",
+        )
 
     async def _sleep(self, delay):
         """

@@ -598,21 +598,25 @@ class CandlesBase(NetworkBase):
         await asyncio.sleep(delay)
 
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
-        fill_candles_task = self._fill_candles_task_owner.task_for(websocket_assistant)
+        primary = websocket_assistant.disconnect() if websocket_assistant is not None else None
+        return await self._on_candle_generation_interruption(websocket_assistant, primary=primary)
+
+    async def _on_candle_generation_interruption(self, generation: object, primary=None):
+        fill_candles_task = self._fill_candles_task_owner.task_for(generation)
         try:
             return await await_primary_then_cleanup(
-                primary=websocket_assistant.disconnect() if websocket_assistant is not None else None,
+                primary=primary,
                 cleanup=(lambda: self._cleanup_fill_candles_task(fill_candles_task))
                 if fill_candles_task is not None else None,
                 logger=self.logger(),
                 cleanup_error_message="Error while cleaning up the fill candles task owner",
             )
         finally:
-            owns_current_state = self._fill_candles_task_owner.is_current_generation(websocket_assistant)
+            owns_current_state = self._fill_candles_task_owner.is_current_generation(generation)
             if owns_current_state:
                 self._ws_candle_available.clear()
                 self._candles.clear()
-            self._fill_candles_task_owner.end_generation(websocket_assistant)
+            self._fill_candles_task_owner.end_generation(generation)
 
     def _start_candle_generation(self, websocket_assistant: WSAssistant):
         self._fill_candles_task_owner.begin_generation(websocket_assistant)

@@ -311,7 +311,7 @@ async def await_primary_then_cleanup(
     logger: Any,
     cleanup_error_message: str,
 ) -> Optional[_Result]:
-    """Run cleanup without allowing it to replace the primary awaitable's outcome."""
+    """Run cleanup with cancellation-aware primary/cleanup outcome precedence."""
 
     result = None
     primary_error = None
@@ -336,7 +336,7 @@ async def await_primary_then_cleanup(
             )
 
     if primary_error is not None:
-        if cleanup_cancellation is not None:
+        if cleanup_cancellation is not None and isinstance(primary_error, asyncio.CancelledError):
             logger.error(
                 cleanup_error_message,
                 exc_info=(
@@ -345,6 +345,8 @@ async def await_primary_then_cleanup(
                     cleanup_cancellation.__traceback__,
                 ),
             )
+        if cleanup_cancellation is not None and not isinstance(primary_error, asyncio.CancelledError):
+            raise cleanup_cancellation
         primary_error.args = primary_error_args
         raise primary_error
     if cleanup_cancellation is not None:

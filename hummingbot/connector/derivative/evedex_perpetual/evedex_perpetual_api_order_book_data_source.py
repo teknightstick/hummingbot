@@ -159,18 +159,36 @@ class EvedexPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         ping_task = self._ping_task
         if ping_task is not None:
             await self._cleanup_ping_task(ping_task)
+        await self._ping_task_owner.wait_until_released()
 
         url = web_utils.wss_url(self._domain)
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        await ws.connect(ws_url=url, ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL + CONSTANTS.WS_PING_TIMEOUT)
+        setup_complete = False
 
-        # Send Centrifugo connect message
-        connect_payload = {
-            "connect": {"name": "js"},
-            "id": self._next_message_id()
-        }
-        connect_request: WSJSONRequest = WSJSONRequest(payload=connect_payload)
-        await ws.send(connect_request)
+        async def connect_and_handshake():
+            nonlocal setup_complete
+            await ws.connect(
+                ws_url=url,
+                ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL + CONSTANTS.WS_PING_TIMEOUT,
+            )
+            connect_payload = {
+                "connect": {"name": "js"},
+                "id": self._next_message_id(),
+            }
+            connect_request: WSJSONRequest = WSJSONRequest(payload=connect_payload)
+            await ws.send(connect_request)
+            setup_complete = True
+
+        async def disconnect_incomplete_setup():
+            if not setup_complete:
+                await ws.disconnect()
+
+        await await_primary_then_cleanup(
+            primary=connect_and_handshake(),
+            cleanup=disconnect_incomplete_setup,
+            logger=self.logger(),
+            cleanup_error_message="Error while disconnecting an incomplete EVEDEX WebSocket setup",
+        )
 
         # Centrifugo server sends pings; respond with pong in message handler.
         self._ws_assistant = ws

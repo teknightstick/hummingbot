@@ -288,15 +288,17 @@ class BitgetAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 )
                 await self._sleep(1.0)
             finally:
-                self._ws_assistant = None
-                if self._ping_task is not None:
-                    self._ping_task.cancel()
-                    try:
-                        await self._ping_task
-                    except asyncio.CancelledError:
-                        pass
-                    self._ping_task = None
-                await self._on_order_stream_interruption(websocket_assistant=ws)
+                try:
+                    if self._ping_task is not None:
+                        self._ping_task.cancel()
+                        try:
+                            await self._ping_task
+                        except asyncio.CancelledError:
+                            pass
+                        self._ping_task = None
+                finally:
+                    self._ws_assistant = None
+                    await self._on_order_stream_interruption(websocket_assistant=ws)
 
     async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
         """

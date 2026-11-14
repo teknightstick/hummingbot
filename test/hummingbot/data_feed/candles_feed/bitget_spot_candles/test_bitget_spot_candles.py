@@ -1,5 +1,6 @@
 import asyncio
 from test.hummingbot.data_feed.candles_feed.test_candles_base import TestCandlesBase
+from unittest.mock import AsyncMock, patch
 
 from hummingbot.connector.test_support.network_mocking_assistant import NetworkMockingAssistant
 from hummingbot.data_feed.candles_feed.bitget_spot_candles import BitgetSpotCandles
@@ -31,6 +32,68 @@ class TestBitgetSpotCandles(TestCandlesBase):
     async def asyncSetUp(self):
         await super().asyncSetUp()
         self.mocking_assistant = NetworkMockingAssistant()
+
+    async def test_listener_waits_for_residual_fill_release_before_connecting(self):
+        generation = object()
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+
+        async def cancellation_suppressing_fill():
+            started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+
+        fill_task = asyncio.create_task(cancellation_suppressing_fill())
+        self.data_feed._start_candle_generation(generation)
+        self.data_feed._create_fill_candles_task(generation, lambda: fill_task)
+        await started.wait()
+
+        with patch.object(type(self.data_feed), "_FILL_CANDLES_TASK_CLEANUP_TIMEOUT", 0.01):
+            await self.data_feed._on_candle_generation_interruption(generation)
+        await cancellation_seen.wait()
+
+        websocket_assistant = AsyncMock()
+        connect_mock = AsyncMock(return_value=websocket_assistant)
+
+        async def process_messages(_):
+            await asyncio.Future()
+
+        listener_task = None
+        try:
+            with patch.object(
+                self.data_feed,
+                "_connected_websocket_assistant",
+                new=connect_mock,
+            ), patch.object(
+                self.data_feed,
+                "_subscribe_channels",
+                new=AsyncMock(),
+            ), patch.object(
+                self.data_feed,
+                "_process_websocket_messages",
+                side_effect=process_messages,
+            ):
+                listener_task = asyncio.create_task(self.data_feed.listen_for_subscriptions())
+                await asyncio.sleep(0)
+                connect_mock.assert_not_awaited()
+
+                release.set()
+                await fill_task
+                for _ in range(10):
+                    if connect_mock.await_count:
+                        break
+                    await asyncio.sleep(0)
+                connect_mock.assert_awaited_once()
+        finally:
+            release.set()
+            if listener_task is not None:
+                listener_task.cancel()
+                await asyncio.gather(listener_task, return_exceptions=True)
+            await asyncio.gather(fill_task, return_exceptions=True)
 
     @staticmethod
     def get_candles_rest_data_mock():

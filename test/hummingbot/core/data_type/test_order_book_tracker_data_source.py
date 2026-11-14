@@ -81,25 +81,31 @@ ALTERNATE_LIFECYCLE_BOUNDARIES = {
     "OrderBookTrackerDataSource.listen_for_subscriptions": {"await_primary_then_cleanup"},
     "hummingbot/data_feed/candles_feed/candles_base.py:"
     "CandlesBase.listen_for_subscriptions": {"await_primary_then_cleanup"},
+    "hummingbot/data_feed/candles_feed/candles_base.py:"
+    "CandlesBase._on_order_stream_interruption": {"_on_candle_generation_interruption"},
     "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
-    "BybitPerpetualAPIOrderBookDataSource.listen_for_subscriptions": {"tasks_future"},
+    "BybitPerpetualAPIOrderBookDataSource.listen_for_subscriptions": {"_run_subscription_tasks"},
     "hummingbot/connector/derivative/injective_v2_perpetual/"
     "injective_v2_perpetual_api_order_book_data_source.py:"
     "InjectiveV2PerpetualAPIOrderBookDataSource.listen_for_subscriptions": {"start"},
     "hummingbot/connector/exchange/bing_x/bing_x_api_order_book_data_source.py:"
-    "BingXAPIOrderBookDataSource.listen_for_subscriptions": {"disconnect"},
+    "BingXAPIOrderBookDataSource.listen_for_subscriptions": {"await_primary_then_cleanup"},
     "hummingbot/connector/exchange/bybit/bybit_api_order_book_data_source.py:"
-    "BybitAPIOrderBookDataSource.listen_for_subscriptions": {"disconnect"},
+    "BybitAPIOrderBookDataSource.listen_for_subscriptions": {"await_primary_then_cleanup"},
     "hummingbot/connector/exchange/injective_v2/injective_v2_api_order_book_data_source.py:"
     "InjectiveV2APIOrderBookDataSource.listen_for_subscriptions": {"start"},
     "hummingbot/connector/exchange/xrpl/xrpl_api_order_book_data_source.py:"
-    "XRPLAPIOrderBookDataSource.listen_for_subscriptions": {"_close_subscription_connection"},
+    "XRPLAPIOrderBookDataSource.listen_for_subscriptions": {"safe_gather"},
     "hummingbot/data_feed/candles_feed/btc_markets_spot_candles/btc_markets_spot_candles.py:"
-    "BtcMarketsSpotCandles.listen_for_subscriptions": {"_polling_task"},
+    "BtcMarketsSpotCandles.listen_for_subscriptions": {"start_network"},
+    "hummingbot/data_feed/candles_feed/bitget_perpetual_candles/bitget_perpetual_candles.py:"
+    "BitgetPerpetualCandles.listen_for_subscriptions": {"listen_for_subscriptions"},
+    "hummingbot/data_feed/candles_feed/bitget_spot_candles/bitget_spot_candles.py:"
+    "BitgetSpotCandles.listen_for_subscriptions": {"listen_for_subscriptions"},
     "hummingbot/data_feed/candles_feed/lighter_perpetual_candles/lighter_perpetual_candles.py:"
-    "LighterPerpetualCandles.listen_for_subscriptions": {"fetch_candles"},
+    "LighterPerpetualCandles.listen_for_subscriptions": {"await_primary_then_cleanup"},
     "hummingbot/data_feed/candles_feed/lighter_spot_candles/lighter_spot_candles.py:"
-    "LighterSpotCandles.listen_for_subscriptions": {"fetch_candles"},
+    "LighterSpotCandles.listen_for_subscriptions": {"await_primary_then_cleanup"},
 }
 
 
@@ -867,7 +873,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         if not isinstance(node, ast.Await):
             return None
         awaited = node.value
-        return awaited.func if isinstance(awaited, ast.Call) else awaited
+        return awaited.func if isinstance(awaited, ast.Call) else None
 
     @classmethod
     def _is_disconnect_boundary_await(cls, function_node, node):
@@ -924,6 +930,256 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         if definition in EXPECTED_ORDER_STREAM_DEFINITIONS:
             return {"_on_order_stream_interruption"}
         return {"_on_order_stream_interruption", "disconnect", "await_primary_then_cleanup"}
+
+    @staticmethod
+    def _literal_truth_value(node):
+        if isinstance(node, ast.Constant):
+            return bool(node.value)
+        if isinstance(node, ast.Name) and node.id == "__debug__":
+            return __debug__
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            operand = OrderStreamOverrideStaticTests._literal_truth_value(node.operand)
+            return None if operand is None else not operand
+        return None
+
+    @staticmethod
+    def _is_irrefutable_match_pattern(pattern):
+        if isinstance(pattern, ast.MatchAs):
+            return pattern.pattern is None
+        if isinstance(pattern, ast.MatchOr):
+            return any(
+                OrderStreamOverrideStaticTests._is_irrefutable_match_pattern(alternative)
+                for alternative in pattern.patterns
+            )
+        return False
+
+    @classmethod
+    def _lifecycle_boundary_dominates_paths(cls, definition, function_node):
+        """Conservatively require a called boundary on every terminal and loop path."""
+        expected_names = cls._expected_lifecycle_boundary_names(definition, function_node)
+
+        def expression_guarantees_boundary(node):
+            if node is None:
+                return False
+            if isinstance(node, ast.Await):
+                return cls._is_lifecycle_boundary_await(function_node, node, expected_names)
+            if isinstance(node, ast.NamedExpr):
+                return expression_guarantees_boundary(node.value)
+            if isinstance(node, ast.UnaryOp):
+                return expression_guarantees_boundary(node.operand)
+            if isinstance(node, ast.BoolOp):
+                # Only the first operand is unconditional. Later operands are short-circuited.
+                return bool(node.values) and expression_guarantees_boundary(node.values[0])
+            if isinstance(node, ast.Compare):
+                # The left operand is unconditional; chained comparators are not.
+                return expression_guarantees_boundary(node.left)
+            if isinstance(node, ast.IfExp):
+                if expression_guarantees_boundary(node.test):
+                    return True
+                truth_value = cls._literal_truth_value(node.test)
+                if truth_value is True:
+                    return expression_guarantees_boundary(node.body)
+                if truth_value is False:
+                    return expression_guarantees_boundary(node.orelse)
+                return (
+                    expression_guarantees_boundary(node.body)
+                    and expression_guarantees_boundary(node.orelse)
+                )
+            if isinstance(node, ast.GeneratorExp) and node.generators:
+                # Creating a generator evaluates only its outermost iterable.
+                return expression_guarantees_boundary(node.generators[0].iter)
+            if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp)):
+                # Iteration, target binding, filters, and result evaluation can all skip a
+                # comprehension body. Only an unconditional outer iterable boundary dominates.
+                return bool(node.generators) and expression_guarantees_boundary(node.generators[0].iter)
+            if isinstance(node, ast.Lambda):
+                defaults = [*node.args.defaults, *node.args.kw_defaults]
+                return any(
+                    expression_guarantees_boundary(default)
+                    for default in defaults
+                    if default is not None
+                )
+            return False
+
+        def block_paths(statements, incoming):
+            paths = set(incoming)
+            for statement in statements:
+                completed = {(control, seen) for control, seen in paths if control != "fallthrough"}
+                active = {seen for control, seen in paths if control == "fallthrough"}
+                if not active:
+                    return completed
+                paths = completed
+                for seen in active:
+                    paths.update(statement_paths(statement, seen))
+            return paths
+
+        def apply_finally(protected_paths, finalbody):
+            finalized = set()
+            for protected_control, protected_seen in protected_paths:
+                final_paths = block_paths(finalbody, {("fallthrough", protected_seen)})
+                for final_control, final_seen in final_paths:
+                    if final_control == "fallthrough":
+                        finalized.add((protected_control, final_seen))
+                    else:
+                        finalized.add((final_control, final_seen))
+            return finalized
+
+        def scoped_awaits(statements):
+            awaits = []
+
+            class AwaitVisitor(ast.NodeVisitor):
+                def visit_Await(self, node):
+                    awaits.append(node)
+                    self.generic_visit(node)
+
+                def visit_AsyncFunctionDef(self, node):
+                    return None
+
+                def visit_FunctionDef(self, node):
+                    return None
+
+                def visit_Lambda(self, node):
+                    return None
+
+                def visit_ClassDef(self, node):
+                    return None
+
+            visitor = AwaitVisitor()
+            for statement in statements:
+                visitor.visit(statement)
+            return awaits
+
+        def statement_paths(node, seen):
+            if isinstance(node, ast.Expr):
+                return {("fallthrough", seen or expression_guarantees_boundary(node.value))}
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                return {("fallthrough", seen or expression_guarantees_boundary(node.value))}
+            if isinstance(node, ast.Return):
+                return {("return", seen or expression_guarantees_boundary(node.value))}
+            if isinstance(node, ast.Raise):
+                return {("raise", seen or expression_guarantees_boundary(node.exc))}
+            if isinstance(node, ast.Break):
+                return {("break", seen)}
+            if isinstance(node, ast.Continue):
+                return {("continue", seen)}
+            if isinstance(node, ast.If):
+                branch_seen = seen or expression_guarantees_boundary(node.test)
+                truth_value = cls._literal_truth_value(node.test)
+                if truth_value is True:
+                    return block_paths(node.body, {("fallthrough", branch_seen)})
+                if truth_value is False:
+                    return block_paths(node.orelse, {("fallthrough", branch_seen)})
+                return (
+                    block_paths(node.body, {("fallthrough", branch_seen)})
+                    | block_paths(node.orelse, {("fallthrough", branch_seen)})
+                )
+            if isinstance(node, ast.While):
+                condition_seen = seen or expression_guarantees_boundary(node.test)
+                truth_value = cls._literal_truth_value(node.test)
+                if truth_value is False:
+                    return block_paths(node.orelse, {("fallthrough", condition_seen)})
+
+                body = block_paths(node.body, {("fallthrough", condition_seen)})
+                exits = {
+                    (control, path_seen)
+                    for control, path_seen in body
+                    if control in {"return", "raise", "loop_exit"}
+                }
+                exits.update(("fallthrough", path_seen) for control, path_seen in body if control == "break")
+                exits.update(
+                    ("loop_exit", path_seen)
+                    for control, path_seen in body
+                    if control in {"fallthrough", "continue"}
+                )
+                if truth_value is True:
+                    return exits
+
+                normal_completion = {condition_seen}
+                normal_completion.update(
+                    path_seen for control, path_seen in body if control in {"fallthrough", "continue"}
+                )
+                exits.update(block_paths(node.orelse, {("fallthrough", value) for value in normal_completion}))
+                return exits
+            if isinstance(node, (ast.For, ast.AsyncFor)):
+                iterable_seen = seen or expression_guarantees_boundary(node.iter)
+                body = block_paths(node.body, {("fallthrough", iterable_seen)})
+                exits = {
+                    (control, path_seen)
+                    for control, path_seen in body
+                    if control in {"return", "raise", "loop_exit"}
+                }
+                exits.update(("fallthrough", path_seen) for control, path_seen in body if control == "break")
+                exits.update(
+                    ("loop_exit", path_seen)
+                    for control, path_seen in body
+                    if control in {"fallthrough", "continue"}
+                )
+                normal_completion = {iterable_seen}
+                normal_completion.update(
+                    path_seen for control, path_seen in body if control in {"fallthrough", "continue"}
+                )
+                exits.update(block_paths(node.orelse, {("fallthrough", value) for value in normal_completion}))
+                return exits
+            if isinstance(node, ast.Try):
+                body = block_paths(node.body, {("fallthrough", seen)})
+                protected = {(control, value) for control, value in body if control != "fallthrough"}
+                possible_await_raises = {
+                    seen or cls._is_lifecycle_boundary_await(function_node, await_node, expected_names)
+                    for await_node in scoped_awaits(node.body)
+                }
+                protected.update(("raise", value) for value in possible_await_raises)
+                normal = {value for control, value in body if control == "fallthrough"}
+                if node.orelse:
+                    protected.update(block_paths(node.orelse, {("fallthrough", value) for value in normal}))
+                else:
+                    protected.update(("fallthrough", value) for value in normal)
+
+                raised = {value for control, value in body if control == "raise"} | possible_await_raises
+                for handler in node.handlers:
+                    for value in raised:
+                        protected.update(block_paths(handler.body, {("fallthrough", value)}))
+                if node.finalbody:
+                    protected = apply_finally(protected, node.finalbody)
+                return protected
+            if isinstance(node, ast.Match):
+                subject_seen = seen or expression_guarantees_boundary(node.subject)
+                paths = set()
+                exhaustive = False
+                unmatched_seen = subject_seen
+                for case in node.cases:
+                    if exhaustive:
+                        break
+                    guard_truth = cls._literal_truth_value(case.guard) if case.guard is not None else True
+                    guard_seen = unmatched_seen or expression_guarantees_boundary(case.guard)
+                    if guard_truth is not False:
+                        paths.update(block_paths(case.body, {("fallthrough", guard_seen)}))
+                    if cls._is_irrefutable_match_pattern(case.pattern):
+                        exhaustive = guard_truth is True
+                        if guard_truth is not True:
+                            unmatched_seen = guard_seen
+                if not exhaustive:
+                    paths.add(("fallthrough", unmatched_seen))
+                return paths
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                return block_paths(node.body, {("fallthrough", seen)})
+            if isinstance(node, ast.Assert):
+                # Assert expressions disappear under -O and can never be a portable boundary.
+                return {("fallthrough", seen), ("raise", seen)}
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                # Nested bodies are not called, but decorators and defaults are eager.
+                eager_expressions = [*node.decorator_list, *node.args.defaults, *node.args.kw_defaults]
+                eager_boundary = any(
+                    expression_guarantees_boundary(expression)
+                    for expression in eager_expressions
+                    if expression is not None
+                )
+                return {("fallthrough", seen or eager_boundary)}
+            if isinstance(node, ast.ClassDef):
+                return {("fallthrough", seen)}
+            return {("fallthrough", seen)}
+
+        terminal_paths = block_paths(function_node.body, {("fallthrough", False)})
+        return bool(terminal_paths) and all(seen for _, seen in terminal_paths)
 
     @classmethod
     def _is_owned_task_cleanup(cls, node):
@@ -999,12 +1255,9 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                     f"{definition} must leave exact assistant identity cleanup to its owning listener",
                 )
 
-        expected_boundary_names = self._expected_lifecycle_boundary_names(definition, function_node)
-        lifecycle_awaits = [node for node in executable_nodes
-                            if self._is_lifecycle_boundary_await(function_node, node, expected_boundary_names)]
         self.assertTrue(
-            lifecycle_awaits,
-            f"{definition} must contain a recognized awaited lifecycle boundary",
+            self._lifecycle_boundary_dominates_paths(definition, function_node),
+            f"{definition} must execute a recognized awaited lifecycle boundary on every path",
         )
 
         disconnect_awaits = [
@@ -1222,32 +1475,24 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 self.assertEqual(0, hits)
 
     def test_comprehension_target_binding_precedes_filters_and_result(self):
-        rejected_sources = (
+        sources = (
             "async def listen_for_subscriptions(self):\n"
             "    [await self._on_order_stream_interruption() for (a, b) in [1]]\n",
             "async def listen_for_subscriptions(self):\n"
             "    [await self._on_order_stream_interruption() for (a, b) in [1, (2, 3)]]\n",
-        )
-        accepted_sources = (
             "async def listen_for_subscriptions(self):\n"
             "    [await self._on_order_stream_interruption() for (a, b) in [(1, 2), 3]]\n",
             "async def listen_for_subscriptions(self, values):\n"
             "    [await self._on_order_stream_interruption() for (a, b) in values]\n",
         )
 
-        for source in rejected_sources:
+        for source in sources:
             with self.subTest(source=source):
                 with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
                     self._audit_definition(
                         "mutated:Listener.listen_for_subscriptions",
                         ast.parse(source).body[0],
                     )
-        for source in accepted_sources:
-            with self.subTest(source=source):
-                self._audit_definition(
-                    "mutated:Listener.listen_for_subscriptions",
-                    ast.parse(source).body[0],
-                )
 
         hits = 0
 
@@ -1257,13 +1502,13 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 hits += 1
 
         namespace = {}
-        exec(compile(rejected_sources[0], "<unpack-runtime-probe>", "exec"), namespace)
+        exec(compile(sources[0], "<unpack-runtime-probe>", "exec"), namespace)
         with self.assertRaises(TypeError):
             asyncio.run(namespace["listen_for_subscriptions"](Probe()))
         self.assertEqual(0, hits)
 
         namespace = {}
-        exec(compile(accepted_sources[0], "<sequential-unpack-runtime-probe>", "exec"), namespace)
+        exec(compile(sources[2], "<sequential-unpack-runtime-probe>", "exec"), namespace)
         with self.assertRaises(TypeError):
             asyncio.run(namespace["listen_for_subscriptions"](Probe()))
         self.assertEqual(1, hits)
@@ -1332,7 +1577,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                     )
 
     def test_static_audit_includes_reachable_try_except_else_and_finally_paths(self):
-        sources = (
+        rejected_sources = (
             "async def listen_for_subscriptions(self):\n"
             "    try:\n"
             "        await self._sleep(1)\n"
@@ -1345,6 +1590,8 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             "        raise\n"
             "    else:\n"
             "        await self._on_order_stream_interruption()\n",
+        )
+        accepted_sources = (
             "async def listen_for_subscriptions(self):\n"
             "    try:\n"
             "        await self._sleep(1)\n"
@@ -1352,7 +1599,14 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             "        await self._on_order_stream_interruption()\n",
         )
 
-        for source in sources:
+        for source in rejected_sources:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+                    self._audit_definition(
+                        "mutated:Listener.listen_for_subscriptions",
+                        ast.parse(source).body[0],
+                    )
+        for source in accepted_sources:
             with self.subTest(source=source):
                 self._audit_definition(
                     "mutated:Listener.listen_for_subscriptions",
@@ -1386,7 +1640,8 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             "            await self._on_order_stream_interruption()\n"
         ).body[0]
 
-        self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+        with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+            self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
 
     def test_static_audit_includes_match_subject_and_guard_expressions(self):
         sources = (
@@ -1416,7 +1671,8 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             "    await self._on_order_stream_interruption()\n"
         ).body[0]
 
-        self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+        with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+            self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
 
     def test_static_audit_keeps_following_boundary_when_an_exhaustive_case_falls_through(self):
         function_node = ast.parse(
@@ -1429,7 +1685,8 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             "    await self._on_order_stream_interruption()\n"
         ).body[0]
 
-        self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+        with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+            self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
 
     def test_static_audit_rejects_boundary_after_exhaustive_terminating_match(self):
         sources = [
@@ -1481,10 +1738,11 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
 
         for source in sources:
             with self.subTest(source=source):
-                self._audit_definition(
-                    "mutated:Listener.listen_for_subscriptions",
-                    ast.parse(source).body[0],
-                )
+                with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+                    self._audit_definition(
+                        "mutated:Listener.listen_for_subscriptions",
+                        ast.parse(source).body[0],
+                    )
 
     def test_static_audit_rejects_match_boundaries_in_false_guards_and_nested_scopes(self):
         sources = (
@@ -1543,7 +1801,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 node = ast.parse(expression, mode="eval").body
                 self.assertEqual(expected, self._constant_value(node))
 
-    def test_static_audit_matches_runtime_for_reviewer_adversarial_probes(self):
+    def test_static_audit_is_conservative_for_reviewer_adversarial_probes(self):
         def decorator(function):
             return function
         cases = (
@@ -1728,7 +1986,11 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         for name, source, arguments, boundary_result, expected_hits in cases:
             with self.subTest(name=name):
                 function_node = ast.parse(source).body[0]
-                if expected_hits:
+                audit_accepts = bool(expected_hits) and name not in {
+                    "shadowed object class pattern stays refutable",
+                    "assert follows optimization mode",
+                }
+                if audit_accepts:
                     self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
                 else:
                     with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
@@ -1746,6 +2008,68 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                 exec(compile(source, "<audit-runtime-probe>", "exec"), namespace)
                 asyncio.run(namespace["listen_for_subscriptions"](Probe(), *arguments))
                 self.assertEqual(expected_hits, hits)
+
+    def test_static_audit_rejects_reviewer_binding_try_comprehension_and_dominance_probes(self):
+        sources = (
+            "async def listen_for_subscriptions(self):\n"
+            "    range = lambda _: ()\n"
+            "    for _ in range(1):\n"
+            "        await self._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self):\n"
+            "    global range\n"
+            "    for _ in range(1):\n"
+            "        await self._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self):\n"
+            "    nonlocal range\n"
+            "    for _ in range(1):\n"
+            "        await self._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self):\n"
+            "    from builtins import range\n"
+            "    for _ in range(0):\n"
+            "        await self._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self, range):\n"
+            "    for _ in range(1):\n"
+            "        await self._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self):\n"
+            "    nonlocal set\n"
+            "    for _ in set():\n"
+            "        await self._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self, value):\n"
+            "    from builtins import object\n"
+            "    match value:\n"
+            "        case object():\n"
+            "            return\n"
+            "        case _:\n"
+            "            await self._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self):\n"
+            "    value = 1\n"
+            "    try:\n"
+            "        value\n"
+            "    except Exception:\n"
+            "        await self._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self):\n"
+            "    try:\n"
+            "        raise ValueError()\n"
+            "    except KeyError:\n"
+            "        await self._on_order_stream_interruption()\n",
+            "async def listen_for_subscriptions(self):\n"
+            "    [await self._on_order_stream_interruption() "
+            "for (range, x) in [(0, 1)] for _ in range(1)]\n",
+            "async def listen_for_subscriptions(self):\n"
+            "    [await self._on_order_stream_interruption() "
+            "for set in [lambda: {1}] for _ in set()]\n",
+            "async def listen_for_subscriptions(self):\n"
+            "    await self._on_order_stream_interruption\n",
+            "async def listen_for_subscriptions(self, flag):\n"
+            "    if flag:\n"
+            "        await self._on_order_stream_interruption()\n",
+        )
+
+        for source in sources:
+            with self.subTest(source=source):
+                function_node = ast.parse(source).body[0]
+                with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+                    self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
 
     def test_generator_outer_iterable_expression_is_eager(self):
         source = (
@@ -2114,6 +2438,27 @@ class OrderBookTrackerDataSourceListenerTests(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(listener_task.cancelled())
         self.assertEqual(1, connection.disconnect_calls)
         self.assertTrue(any("disconnect failed" in record for record in log_context.output))
+        self.assertIsNone(self.data_source._ws_assistant)
+
+    async def test_owner_cancellation_during_cleanup_after_primary_failure_prevents_reconnect(self):
+        disconnect_release = asyncio.Event()
+        connection = _ControllableConnection(disconnect_release=disconnect_release)
+        assistant = WSAssistant(connection)
+        replacement = WSAssistant(_ControllableConnection())
+        self.data_source._process_websocket_messages = AsyncMock(side_effect=RuntimeError("primary failed"))
+
+        listener_task = await self._start_listener(assistant)
+        await asyncio.wait_for(connection.disconnect_started.wait(), timeout=0.2)
+        self.data_source.assistants.put_nowait(replacement)
+
+        listener_task.cancel("shutdown")
+        with self.assertRaises(asyncio.CancelledError) as cancellation_context:
+            await listener_task
+
+        self._assert_task_boundary_cancellation(cancellation_context.exception, ("shutdown",))
+        self.assertTrue(listener_task.cancelled())
+        self.assertEqual([assistant], self.data_source.connected_assistants)
+        self.assertEqual(1, self.data_source.assistants.qsize())
         self.assertIsNone(self.data_source._ws_assistant)
 
     async def test_direct_listener_await_preserves_exact_primary_cancellation_and_args(self):

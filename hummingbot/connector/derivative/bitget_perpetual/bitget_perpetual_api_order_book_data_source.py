@@ -372,15 +372,17 @@ class BitgetPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 )
                 await self._sleep(1.0)
             finally:
-                if self._ping_task is not None:
-                    self._ping_task.cancel()
-                    try:
-                        await self._ping_task
-                    except asyncio.CancelledError:
-                        pass
-                    self._ping_task = None
-                self._ws_assistant = None  # Clear on disconnection
-                await self._on_order_stream_interruption(websocket_assistant=ws)
+                try:
+                    if self._ping_task is not None:
+                        self._ping_task.cancel()
+                        try:
+                            await self._ping_task
+                        except asyncio.CancelledError:
+                            pass
+                        self._ping_task = None
+                finally:
+                    self._ws_assistant = None  # Clear on disconnection
+                    await self._on_order_stream_interruption(websocket_assistant=ws)
 
     @classmethod
     def _get_next_subscribe_id(cls) -> int:

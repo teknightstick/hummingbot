@@ -78,30 +78,31 @@ class BybitPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         Only establishes WebSocket connections for the types of perpetuals that are configured.
         Dynamic subscription is only supported for pair types that have an active WebSocket connection.
         """
-        tasks_future = None
+        linear_trading_pairs, non_linear_trading_pairs = bybit_perpetual_utils.get_linear_non_linear_split(
+            self._trading_pairs
+        )
+
+        tasks = []
+        if linear_trading_pairs:
+            tasks.append(self._listen_for_subscriptions_on_url(
+                url=web_utils.wss_linear_public_url(self._domain),
+                trading_pairs=linear_trading_pairs,
+                is_linear=True))
+        if non_linear_trading_pairs:
+            tasks.append(self._listen_for_subscriptions_on_url(
+                url=web_utils.wss_non_linear_public_url(self._domain),
+                trading_pairs=non_linear_trading_pairs,
+                is_linear=False))
+
+        await self._run_subscription_tasks(tasks)
+
+    @staticmethod
+    async def _run_subscription_tasks(tasks):
+        tasks_future = asyncio.gather(*tasks)
         try:
-            linear_trading_pairs, non_linear_trading_pairs = bybit_perpetual_utils.get_linear_non_linear_split(
-                self._trading_pairs
-            )
-
-            tasks = []
-            if linear_trading_pairs:
-                tasks.append(self._listen_for_subscriptions_on_url(
-                    url=web_utils.wss_linear_public_url(self._domain),
-                    trading_pairs=linear_trading_pairs,
-                    is_linear=True))
-            if non_linear_trading_pairs:
-                tasks.append(self._listen_for_subscriptions_on_url(
-                    url=web_utils.wss_non_linear_public_url(self._domain),
-                    trading_pairs=non_linear_trading_pairs,
-                    is_linear=False))
-
-            if tasks:
-                tasks_future = asyncio.gather(*tasks)
-                await tasks_future
-
+            await tasks_future
         except asyncio.CancelledError:
-            tasks_future and tasks_future.cancel()
+            tasks_future.cancel()
             raise
 
     async def _listen_for_subscriptions_on_url(self, url: str, trading_pairs: List[str], is_linear: bool = True):

@@ -240,28 +240,19 @@ class BitgetSpotCandles(CandlesBase):
         Connects to the candlestick websocket endpoint and listens to the messages sent by the
         exchange.
         """
-        ws: Optional[WSAssistant] = None
-        while True:
-            try:
-                ws: WSAssistant = await self._connected_websocket_assistant()
-                await self._subscribe_channels(ws)
-                self._ping_task = asyncio.create_task(self.send_interval_ping(ws))
-                await self._process_websocket_messages(websocket_assistant=ws)
-            except asyncio.CancelledError:
-                raise
-            except ConnectionError as connection_exception:
-                self.logger().warning(f"The websocket connection was closed ({connection_exception})")
-            except Exception:
-                self.logger().exception(
-                    "Unexpected error occurred when listening to public klines. Retrying in 1 seconds...",
-                )
-                await self._sleep(1.0)
-            finally:
-                if self._ping_task is not None:
-                    self._ping_task.cancel()
-                    try:
-                        await self._ping_task
-                    except asyncio.CancelledError:
-                        pass
+        return await super().listen_for_subscriptions()
+
+    async def _process_websocket_messages(self, websocket_assistant: WSAssistant):
+        self._ping_task = asyncio.create_task(self.send_interval_ping(websocket_assistant))
+        try:
+            return await super()._process_websocket_messages(websocket_assistant)
+        finally:
+            ping_task = self._ping_task
+            if ping_task is not None:
+                ping_task.cancel()
+                try:
+                    await ping_task
+                except asyncio.CancelledError:
+                    pass
+                if self._ping_task is ping_task:
                     self._ping_task = None
-                await self._on_order_stream_interruption(websocket_assistant=ws)

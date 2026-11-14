@@ -43,6 +43,53 @@ class TestLighterSpotCandles(TestCandlesBase):
         self.mocking_assistant = NetworkMockingAssistant()
         self.resume_test_event = asyncio.Event()
 
+    async def test_listener_waits_for_residual_fill_release_before_polling(self):
+        generation = object()
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+
+        async def cancellation_suppressing_fill():
+            started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+
+        fill_task = asyncio.create_task(cancellation_suppressing_fill())
+        self.data_feed._start_candle_generation(generation)
+        self.data_feed._create_fill_candles_task(generation, lambda: fill_task)
+        await started.wait()
+
+        with patch.object(type(self.data_feed), "_FILL_CANDLES_TASK_CLEANUP_TIMEOUT", 0.01):
+            await self.data_feed._on_candle_generation_interruption(generation)
+        await cancellation_seen.wait()
+
+        listener_task = None
+        try:
+            with patch(PATCH_FETCH, new_callable=AsyncMock) as mock_fetch:
+                mock_fetch.side_effect = asyncio.CancelledError
+                listener_task = asyncio.create_task(self.data_feed.listen_for_subscriptions())
+                await asyncio.sleep(0)
+                mock_fetch.assert_not_awaited()
+
+                release.set()
+                await fill_task
+                for _ in range(10):
+                    if mock_fetch.await_count:
+                        break
+                    await asyncio.sleep(0)
+                mock_fetch.assert_awaited_once()
+                with self.assertRaises(asyncio.CancelledError):
+                    await listener_task
+        finally:
+            release.set()
+            if listener_task is not None and not listener_task.done():
+                listener_task.cancel()
+                await asyncio.gather(listener_task, return_exceptions=True)
+            await asyncio.gather(fill_task, return_exceptions=True)
+
     # ---- Mock data ----
 
     @staticmethod
@@ -340,11 +387,14 @@ class TestLighterSpotCandles(TestCandlesBase):
              patch("hummingbot.data_feed.candles_feed.lighter_spot_candles.lighter_spot_candles.safe_ensure_future") as mock_future:
             mock_fetch.return_value = candle
             mock_sleep.side_effect = asyncio.CancelledError
+            mock_future.side_effect = asyncio.create_task
 
             with self.assertRaises(asyncio.CancelledError):
                 await self.data_feed.listen_for_subscriptions()
 
-            self.assertTrue(self.data_feed._ws_candle_available.is_set())
+            self.assertFalse(self.data_feed._ws_candle_available.is_set())
+            self.assertEqual([], list(self.data_feed._candles))
+            self.assertIsNone(self.data_feed._fill_candles_task_owner._current_generation)
             mock_future.assert_called_once()
 
     async def test_subscribe_channels_raises_cancel_exception(self):
@@ -365,11 +415,12 @@ class TestLighterSpotCandles(TestCandlesBase):
         )
         mock_fetch.return_value = candle
         mock_sleep.side_effect = asyncio.CancelledError
+        mock_future.side_effect = asyncio.create_task
 
         with self.assertRaises(asyncio.CancelledError):
             await self.data_feed.listen_for_subscriptions()
 
-        self.assertEqual(self.data_feed.candles_df.shape[0], 1)
+        self.assertEqual(self.data_feed.candles_df.shape[0], 0)
         self.assertEqual(self.data_feed.candles_df.shape[1], 10)
         mock_future.assert_called_once()
 
@@ -388,15 +439,14 @@ class TestLighterSpotCandles(TestCandlesBase):
         )
         mock_fetch.side_effect = [candle, updated_candle, asyncio.CancelledError()]
         mock_sleep.return_value = None
+        mock_future.side_effect = asyncio.create_task
 
         with self.assertRaises(asyncio.CancelledError):
             await self.data_feed.listen_for_subscriptions()
 
-        # Still only one candle (same timestamp → update, not append)
-        self.assertEqual(self.data_feed.candles_df.shape[0], 1)
+        # Cancellation tears down the complete polling generation and its state.
+        self.assertEqual(self.data_feed.candles_df.shape[0], 0)
         self.assertEqual(self.data_feed.candles_df.shape[1], 10)
-        # High was updated in-place
-        self.assertAlmostEqual(float(self.data_feed._candles[-1][2]), 94200.0)
 
     @patch("hummingbot.data_feed.candles_feed.lighter_spot_candles.lighter_spot_candles.safe_ensure_future")
     @patch(PATCH_SLEEP, new_callable=AsyncMock)
@@ -413,11 +463,12 @@ class TestLighterSpotCandles(TestCandlesBase):
         )
         mock_fetch.side_effect = [candle1, candle2, asyncio.CancelledError()]
         mock_sleep.return_value = None
+        mock_future.side_effect = asyncio.create_task
 
         with self.assertRaises(asyncio.CancelledError):
             await self.data_feed.listen_for_subscriptions()
 
-        self.assertEqual(self.data_feed.candles_df.shape[0], 2)
+        self.assertEqual(self.data_feed.candles_df.shape[0], 0)
         self.assertEqual(self.data_feed.candles_df.shape[1], 10)
 
     @patch(PATCH_SLEEP, new_callable=AsyncMock)

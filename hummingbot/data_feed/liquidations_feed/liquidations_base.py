@@ -11,7 +11,7 @@ from pandas import DataFrame
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.network_base import NetworkBase
 from hummingbot.core.network_iterator import NetworkStatus
-from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.core.utils.async_utils import await_primary_then_cleanup, safe_ensure_future
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 
@@ -215,4 +215,9 @@ class LiquidationsBase(NetworkBase):
         await asyncio.sleep(delay)
 
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
-        websocket_assistant and await websocket_assistant.disconnect()
+        await await_primary_then_cleanup(
+            primary=websocket_assistant.disconnect() if websocket_assistant is not None else None,
+            cleanup=None,
+            logger=self.logger(),
+            cleanup_error_message="Error while interrupting the liquidation stream",
+        )

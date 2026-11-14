@@ -4,7 +4,7 @@ import time
 from typing import List, Optional
 
 from hummingbot.core.network_iterator import NetworkStatus
-from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.core.utils.async_utils import await_primary_then_cleanup, safe_ensure_future
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.lighter_spot_candles import constants as CONSTANTS
 from hummingbot.logger import HummingbotLogger
@@ -145,32 +145,47 @@ class LighterSpotCandles(CandlesBase):
 
     async def listen_for_subscriptions(self):
         # Lighter has no WebSocket candle stream — poll REST every 10 seconds
-        while True:
-            try:
-                now_s = int(time.time())
-                current_candle_end = self._round_timestamp_to_interval_multiple(now_s) + self.interval_in_seconds
-                candles = await self.fetch_candles(end_time=current_candle_end, limit=1)
-                if len(candles) > 0:
-                    candle_row = candles[-1].astype(float)
-                    if len(self._candles) == 0:
-                        self._candles.append(candle_row)
-                        self._ws_candle_available.set()
-                        safe_ensure_future(self.fill_historical_candles())
-                    else:
-                        latest_ts = int(self._candles[-1][0])
-                        current_ts = int(candle_row[0])
-                        if current_ts > latest_ts:
+        generation = object()
+        await self._fill_candles_task_owner.wait_until_released()
+        self._start_candle_generation(generation)
+
+        async def poll_candles():
+            while True:
+                try:
+                    now_s = int(time.time())
+                    current_candle_end = self._round_timestamp_to_interval_multiple(now_s) + self.interval_in_seconds
+                    candles = await self.fetch_candles(end_time=current_candle_end, limit=1)
+                    if len(candles) > 0:
+                        candle_row = candles[-1].astype(float)
+                        if len(self._candles) == 0:
                             self._candles.append(candle_row)
-                        elif current_ts == latest_ts:
-                            self._candles[-1] = candle_row
-                await self._sleep(CONSTANTS.CANDLE_POLL_INTERVAL_SECONDS)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.logger().exception(
-                    "Unexpected error polling Lighter candles. Retrying in 5s..."
-                )
-                await self._sleep(5.0)
+                            self._ws_candle_available.set()
+                            self._create_fill_candles_task(
+                                generation,
+                                lambda: safe_ensure_future(self.fill_historical_candles()),
+                            )
+                        else:
+                            latest_ts = int(self._candles[-1][0])
+                            current_ts = int(candle_row[0])
+                            if current_ts > latest_ts:
+                                self._candles.append(candle_row)
+                            elif current_ts == latest_ts:
+                                self._candles[-1] = candle_row
+                    await self._sleep(CONSTANTS.CANDLE_POLL_INTERVAL_SECONDS)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.logger().exception(
+                        "Unexpected error polling Lighter candles. Retrying in 5s..."
+                    )
+                    await self._sleep(5.0)
+
+        return await await_primary_then_cleanup(
+            primary=poll_candles(),
+            cleanup=lambda: self._on_candle_generation_interruption(generation),
+            logger=self.logger(),
+            cleanup_error_message="Error while stopping the Lighter spot candle generation",
+        )
 
     def ws_subscription_payload(self):
         return {}
