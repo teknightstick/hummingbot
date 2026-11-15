@@ -602,12 +602,15 @@ class CandlesBase(NetworkBase):
         return await self._on_candle_generation_interruption(websocket_assistant, primary=primary)
 
     async def _on_candle_generation_interruption(self, generation: object, primary=None):
-        fill_candles_task = self._fill_candles_task_owner.task_for(generation)
+        async def cleanup_fill_candles_task():
+            fill_candles_task = self._fill_candles_task_owner.task_for(generation)
+            if fill_candles_task is not None:
+                await self._cleanup_fill_candles_task(fill_candles_task)
+
         try:
             return await await_primary_then_cleanup(
                 primary=primary,
-                cleanup=(lambda: self._cleanup_fill_candles_task(fill_candles_task))
-                if fill_candles_task is not None else None,
+                cleanup=cleanup_fill_candles_task,
                 logger=self.logger(),
                 cleanup_error_message="Error while cleaning up the fill candles task owner",
             )

@@ -268,16 +268,20 @@ class PacificaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             raise
 
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
-        ping_task = self._ping_task_owner.task_for(websocket_assistant)
         try:
             return await await_primary_then_cleanup(
                 primary=super()._on_order_stream_interruption(websocket_assistant),
-                cleanup=(lambda: self._cleanup_ping_task(ping_task)) if ping_task is not None else None,
+                cleanup=lambda: self._cleanup_ping_generation(websocket_assistant),
                 logger=self.logger(),
                 cleanup_error_message="Error while cleaning up the Pacifica ping task owner",
             )
         finally:
             self._ping_task_owner.end_generation(websocket_assistant)
+
+    async def _cleanup_ping_generation(self, websocket_assistant: Optional[WSAssistant]):
+        ping_task = self._ping_task_owner.task_for(websocket_assistant)
+        if ping_task is not None:
+            await self._cleanup_ping_task(ping_task)
 
     async def _cleanup_ping_task(self, ping_task: asyncio.Task):
         await self._ping_task_owner.cleanup(ping_task, timeout=self._PING_TASK_CLEANUP_TIMEOUT)

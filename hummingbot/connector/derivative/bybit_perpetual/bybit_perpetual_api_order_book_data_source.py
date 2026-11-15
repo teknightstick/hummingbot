@@ -12,6 +12,7 @@ from hummingbot.core.data_type.funding_info import FundingInfo, FundingInfoUpdat
 from hummingbot.core.data_type.order_book import OrderBookMessage
 from hummingbot.core.data_type.order_book_message import OrderBookMessageType
 from hummingbot.core.data_type.perpetual_api_order_book_data_source import PerpetualAPIOrderBookDataSource
+from hummingbot.core.utils.async_utils import await_primary_then_cleanup
 from hummingbot.core.utils.tracking_nonce import NonceCreator
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
@@ -78,23 +79,31 @@ class BybitPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         Only establishes WebSocket connections for the types of perpetuals that are configured.
         Dynamic subscription is only supported for pair types that have an active WebSocket connection.
         """
-        linear_trading_pairs, non_linear_trading_pairs = bybit_perpetual_utils.get_linear_non_linear_split(
-            self._trading_pairs
+        async def listen_on_urls():
+            linear_trading_pairs, non_linear_trading_pairs = bybit_perpetual_utils.get_linear_non_linear_split(
+                self._trading_pairs
+            )
+
+            tasks = []
+            if linear_trading_pairs:
+                tasks.append(self._listen_for_subscriptions_on_url(
+                    url=web_utils.wss_linear_public_url(self._domain),
+                    trading_pairs=linear_trading_pairs,
+                    is_linear=True))
+            if non_linear_trading_pairs:
+                tasks.append(self._listen_for_subscriptions_on_url(
+                    url=web_utils.wss_non_linear_public_url(self._domain),
+                    trading_pairs=non_linear_trading_pairs,
+                    is_linear=False))
+
+            await self._run_subscription_tasks(tasks)
+
+        await await_primary_then_cleanup(
+            primary=listen_on_urls(),
+            cleanup=None,
+            logger=self.logger(),
+            cleanup_error_message="Error while interrupting Bybit perpetual subscription tasks",
         )
-
-        tasks = []
-        if linear_trading_pairs:
-            tasks.append(self._listen_for_subscriptions_on_url(
-                url=web_utils.wss_linear_public_url(self._domain),
-                trading_pairs=linear_trading_pairs,
-                is_linear=True))
-        if non_linear_trading_pairs:
-            tasks.append(self._listen_for_subscriptions_on_url(
-                url=web_utils.wss_non_linear_public_url(self._domain),
-                trading_pairs=non_linear_trading_pairs,
-                is_linear=False))
-
-        await self._run_subscription_tasks(tasks)
 
     @staticmethod
     async def _run_subscription_tasks(tasks):
@@ -132,18 +141,31 @@ class BybitPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 )
                 await self._sleep(5.0)
             finally:
-                # Clear the WebSocket assistant reference on disconnect
-                if is_linear:
-                    self._linear_ws_assistant = None
-                else:
-                    self._non_linear_ws_assistant = None
-                ws and await ws.disconnect()
+                try:
+                    if ws is not None:
+                        await ws.disconnect()
+                finally:
+                    # A retired listener must not clear a replacement connection.
+                    if is_linear and self._linear_ws_assistant is ws:
+                        self._linear_ws_assistant = None
+                    elif not is_linear and self._non_linear_ws_assistant is ws:
+                        self._non_linear_ws_assistant = None
 
     async def _get_connected_websocket_assistant(self, ws_url: str) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        await ws.connect(
-            ws_url=ws_url, message_timeout=CONSTANTS.SECONDS_TO_WAIT_TO_RECEIVE_MESSAGE
-        )
+        try:
+            await ws.connect(
+                ws_url=ws_url, message_timeout=CONSTANTS.SECONDS_TO_WAIT_TO_RECEIVE_MESSAGE
+            )
+        except BaseException:
+            try:
+                await ws.disconnect()
+            except BaseException as cleanup_error:
+                self.logger().error(
+                    "Error while disconnecting an incomplete Bybit perpetual WebSocket setup",
+                    exc_info=(type(cleanup_error), cleanup_error, cleanup_error.__traceback__),
+                )
+            raise
         return ws
 
     async def _subscribe_to_channels(self, ws: WSAssistant, trading_pairs: List[str]):

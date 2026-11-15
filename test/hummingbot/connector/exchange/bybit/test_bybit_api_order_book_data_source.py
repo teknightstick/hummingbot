@@ -241,6 +241,39 @@ class TestBybitAPIOrderBookDataSource(IsolatedAsyncioWrapperTestCase):
         }
         self.assertEqual(expected_diff_subscription, sent_subscription_messages[1])
 
+    async def test_stale_listener_disconnects_exact_ws_without_clearing_replacement(self):
+        old_websocket = AsyncMock()
+        replacement_websocket = AsyncMock()
+        processing_started = asyncio.Event()
+
+        async def process_old_websocket(*_args, **_kwargs):
+            processing_started.set()
+            await asyncio.Future()
+
+        with patch.object(
+            self.ob_data_source._api_factory,
+            "get_ws_assistant",
+            new=AsyncMock(return_value=old_websocket),
+        ), patch.object(
+            self.ob_data_source,
+            "_subscribe_channels",
+            new=AsyncMock(),
+        ), patch.object(
+            self.ob_data_source,
+            "_process_ws_messages",
+            side_effect=process_old_websocket,
+        ):
+            listener_task = asyncio.create_task(self.ob_data_source.listen_for_subscriptions())
+            await processing_started.wait()
+            self.ob_data_source._ws_assistant = replacement_websocket
+            listener_task.cancel("retire old listener")
+
+            with self.assertRaises(asyncio.CancelledError):
+                await listener_task
+
+        old_websocket.disconnect.assert_awaited_once_with()
+        self.assertIs(self.ob_data_source._ws_assistant, replacement_websocket)
+
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
     @patch("hummingbot.connector.exchange.bybit.bybit_api_order_book_data_source.BybitAPIOrderBookDataSource._time")
     async def test_listen_for_subscriptions_sends_ping_message_before_ping_interval_finishes(

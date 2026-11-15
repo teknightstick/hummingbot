@@ -382,6 +382,59 @@ class BybitPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
             self._is_logged("INFO", "Subscribed to public order book, trade and funding info channels...")
         )
 
+    async def test_nested_listener_disconnects_exact_ws_without_clearing_replacement(self):
+        old_websocket = AsyncMock()
+        replacement_websocket = AsyncMock()
+        processing_started = asyncio.Event()
+
+        async def process_old_websocket(*_args, **_kwargs):
+            processing_started.set()
+            await asyncio.Future()
+
+        with patch.object(
+            self.data_source,
+            "_get_connected_websocket_assistant",
+            new=AsyncMock(return_value=old_websocket),
+        ), patch.object(
+            self.data_source,
+            "_subscribe_to_channels",
+            new=AsyncMock(),
+        ), patch.object(
+            self.data_source,
+            "_process_websocket_messages",
+            side_effect=process_old_websocket,
+        ):
+            listener_task = asyncio.create_task(
+                self.data_source._listen_for_subscriptions_on_url(
+                    url="wss://old.example",
+                    trading_pairs=[self.trading_pair],
+                    is_linear=True,
+                )
+            )
+            await processing_started.wait()
+            self.data_source._linear_ws_assistant = replacement_websocket
+            listener_task.cancel("retire old listener")
+
+            with self.assertRaises(asyncio.CancelledError):
+                await listener_task
+
+        old_websocket.disconnect.assert_awaited_once_with()
+        self.assertIs(self.data_source._linear_ws_assistant, replacement_websocket)
+
+    async def test_connected_websocket_disconnects_exact_assistant_when_connect_fails(self):
+        websocket_assistant = AsyncMock()
+        websocket_assistant.connect.side_effect = RuntimeError("connect failed")
+
+        with patch.object(
+            self.data_source._api_factory,
+            "get_ws_assistant",
+            new=AsyncMock(return_value=websocket_assistant),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "connect failed"):
+                await self.data_source._get_connected_websocket_assistant("wss://old.example")
+
+        websocket_assistant.disconnect.assert_awaited_once_with()
+
     @patch("hummingbot.core.data_type.order_book_tracker_data_source.OrderBookTrackerDataSource._sleep")
     @patch("aiohttp.ClientSession.ws_connect")
     async def test_listen_for_subscriptions_raises_cancel_exception(self, mock_ws, _: AsyncMock):

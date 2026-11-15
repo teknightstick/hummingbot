@@ -370,6 +370,47 @@ class BitgetPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase)
         self.assertEqual(expected_subscription, sent_subscription_messages[0])
         self.assertTrue(self._is_logged("INFO", "Subscribed to public channels..."))
 
+    async def test_connected_websocket_disconnects_exact_assistant_when_connect_fails(self):
+        websocket_assistant = AsyncMock()
+        websocket_assistant.connect.side_effect = RuntimeError("connect failed")
+
+        with patch.object(
+            self.data_source._api_factory,
+            "get_ws_assistant",
+            new=AsyncMock(return_value=websocket_assistant),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "connect failed"):
+                await self.data_source._connected_websocket_assistant()
+
+        websocket_assistant.disconnect.assert_awaited_once_with()
+
+    async def test_stale_interruption_preserves_replacement_websocket_and_ping_task(self):
+        old_websocket = AsyncMock()
+        replacement_websocket = AsyncMock()
+        old_ping_started = asyncio.Event()
+
+        async def old_ping(_websocket_assistant):
+            old_ping_started.set()
+            await asyncio.Future()
+
+        replacement_ping = asyncio.create_task(asyncio.sleep(10))
+        try:
+            with patch.object(self.data_source, "send_interval_ping", side_effect=old_ping):
+                self.data_source._create_ping_task(old_websocket)
+                await old_ping_started.wait()
+                self.data_source._ws_assistant = replacement_websocket
+                self.data_source._ping_task = replacement_ping
+
+                await self.data_source._on_order_stream_interruption(old_websocket)
+
+            old_websocket.disconnect.assert_awaited_once_with()
+            self.assertIs(self.data_source._ws_assistant, replacement_websocket)
+            self.assertIs(self.data_source._ping_task, replacement_ping)
+            self.assertFalse(replacement_ping.cancelled())
+        finally:
+            replacement_ping.cancel()
+            await asyncio.gather(replacement_ping, return_exceptions=True)
+
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
     async def test_listen_for_subscriptions_for_usdc_product_type_pair(
         self,

@@ -5,6 +5,7 @@ from hummingbot.connector.exchange.bitget import bitget_constants as CONSTANTS, 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+from hummingbot.core.utils.async_utils import GenerationOwnedTaskOwner, await_primary_then_cleanup
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest, WSPlainTextRequest
 from hummingbot.core.web_assistant.rest_assistant import RESTAssistant
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
@@ -20,6 +21,7 @@ class BitgetAPIOrderBookDataSource(OrderBookTrackerDataSource):
     """
     _DYNAMIC_SUBSCRIBE_ID_START = 100
     _next_subscribe_id: int = _DYNAMIC_SUBSCRIBE_ID_START
+    _PING_TASK_CLEANUP_TIMEOUT = 1.0
 
     def __init__(
         self,
@@ -31,6 +33,15 @@ class BitgetAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._connector: 'BitgetExchange' = connector
         self._api_factory: WebAssistantsFactory = api_factory
         self._ping_task: Optional[asyncio.Task] = None
+        self._ping_task_owner = GenerationOwnedTaskOwner(
+            logger=self.logger(),
+            cleanup_error_message="Error while cleaning up the Bitget WebSocket ping task",
+            residual_warning_message=(
+                "Bitget WebSocket ping task did not stop before the cleanup deadline; "
+                "retaining residual ownership."
+            ),
+            on_task_done=self._release_ping_task,
+        )
 
     async def get_last_traded_prices(
         self,
@@ -172,14 +183,57 @@ class BitgetAPIOrderBookDataSource(OrderBookTrackerDataSource):
             message_queue.put_nowait(trade_message)
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
+        await self._ping_task_owner.wait_until_released()
         websocket_assistant: WSAssistant = await self._api_factory.get_ws_assistant()
-
-        await websocket_assistant.connect(
-            ws_url=web_utils.public_ws_url(),
-            message_timeout=CONSTANTS.SECONDS_TO_WAIT_TO_RECEIVE_MESSAGE,
-        )
+        try:
+            await websocket_assistant.connect(
+                ws_url=web_utils.public_ws_url(),
+                message_timeout=CONSTANTS.SECONDS_TO_WAIT_TO_RECEIVE_MESSAGE,
+            )
+        except BaseException:
+            try:
+                await websocket_assistant.disconnect()
+            except BaseException as cleanup_error:
+                self.logger().error(
+                    "Error while disconnecting an incomplete Bitget WebSocket setup",
+                    exc_info=(type(cleanup_error), cleanup_error, cleanup_error.__traceback__),
+                )
+            raise
 
         return websocket_assistant
+
+    def _create_ping_task(self, websocket_assistant: WSAssistant) -> asyncio.Task:
+        ping_task = self._ping_task_owner.create_task(
+            websocket_assistant,
+            lambda: asyncio.create_task(self.send_interval_ping(websocket_assistant)),
+        )
+        self._ping_task = (
+            ping_task if self._ping_task_owner.task_for(websocket_assistant) is ping_task else None
+        )
+        return ping_task
+
+    def _release_ping_task(self, ping_task: asyncio.Task):
+        if self._ping_task is ping_task:
+            self._ping_task = None
+
+    async def _cleanup_ping_task(self, ping_task: asyncio.Task):
+        await self._ping_task_owner.cleanup(ping_task, timeout=self._PING_TASK_CLEANUP_TIMEOUT)
+
+    async def _cleanup_ping_generation(self, websocket_assistant: Optional[WSAssistant]):
+        ping_task = self._ping_task_owner.task_for(websocket_assistant)
+        if ping_task is not None:
+            await self._cleanup_ping_task(ping_task)
+
+    async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
+        try:
+            return await await_primary_then_cleanup(
+                primary=super()._on_order_stream_interruption(websocket_assistant),
+                cleanup=lambda: self._cleanup_ping_generation(websocket_assistant),
+                logger=self.logger(),
+                cleanup_error_message="Error while cleaning up the Bitget ping task owner",
+            )
+        finally:
+            self._ping_task_owner.end_generation(websocket_assistant)
 
     async def _subscribe_channels(self, ws: WSAssistant) -> None:
         try:
@@ -267,16 +321,28 @@ class BitgetAPIOrderBookDataSource(OrderBookTrackerDataSource):
             self.logger().exception("Error sending interval PING")
 
     async def listen_for_subscriptions(self) -> NoReturn:
-        ws: Optional[WSAssistant] = None
         while True:
-            try:
-                ws: WSAssistant = await self._connected_websocket_assistant()
+            ws: Optional[WSAssistant] = None
+
+            async def listen_on_websocket():
+                nonlocal ws
+                ws = await self._connected_websocket_assistant()
                 self._ws_assistant = ws  # Store for dynamic subscriptions
                 await self._subscribe_channels(ws)
-                self._ping_task = asyncio.create_task(self.send_interval_ping(ws))
-                await self._process_websocket_messages(websocket_assistant=ws)
-            except asyncio.CancelledError:
-                raise
+                self._create_ping_task(ws)
+                return await self._process_websocket_messages(websocket_assistant=ws)
+
+            try:
+                try:
+                    await await_primary_then_cleanup(
+                        primary=listen_on_websocket(),
+                        cleanup=lambda: self._on_order_stream_interruption(websocket_assistant=ws),
+                        logger=self.logger(),
+                        cleanup_error_message="Error while interrupting the Bitget order book stream",
+                    )
+                finally:
+                    if self._ws_assistant is ws:
+                        self._ws_assistant = None
             except ConnectionError as connection_exception:
                 self.logger().warning(
                     f"The websocket connection was closed ({connection_exception})"
@@ -287,18 +353,6 @@ class BitgetAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "Retrying in 5 seconds...",
                 )
                 await self._sleep(1.0)
-            finally:
-                try:
-                    if self._ping_task is not None:
-                        self._ping_task.cancel()
-                        try:
-                            await self._ping_task
-                        except asyncio.CancelledError:
-                            pass
-                        self._ping_task = None
-                finally:
-                    self._ws_assistant = None
-                    await self._on_order_stream_interruption(websocket_assistant=ws)
 
     async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
         """

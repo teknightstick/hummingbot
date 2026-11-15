@@ -31,6 +31,8 @@ EXPECTED_ORDER_STREAM_DEFINITIONS = {
     "BinancePerpetualAPIOrderBookDataSource.listen_for_subscriptions",
     "hummingbot/connector/derivative/bitget_perpetual/bitget_perpetual_api_order_book_data_source.py:"
     "BitgetPerpetualAPIOrderBookDataSource.listen_for_subscriptions",
+    "hummingbot/connector/derivative/bitget_perpetual/bitget_perpetual_api_order_book_data_source.py:"
+    "BitgetPerpetualAPIOrderBookDataSource._on_order_stream_interruption",
     "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
     "BybitPerpetualAPIOrderBookDataSource.listen_for_subscriptions",
     "hummingbot/connector/derivative/evedex_perpetual/evedex_perpetual_api_order_book_data_source.py:"
@@ -44,6 +46,8 @@ EXPECTED_ORDER_STREAM_DEFINITIONS = {
     "BingXAPIOrderBookDataSource.listen_for_subscriptions",
     "hummingbot/connector/exchange/bitget/bitget_api_order_book_data_source.py:"
     "BitgetAPIOrderBookDataSource.listen_for_subscriptions",
+    "hummingbot/connector/exchange/bitget/bitget_api_order_book_data_source.py:"
+    "BitgetAPIOrderBookDataSource._on_order_stream_interruption",
     "hummingbot/connector/exchange/bybit/bybit_api_order_book_data_source.py:"
     "BybitAPIOrderBookDataSource.listen_for_subscriptions",
     "hummingbot/connector/exchange/gemini/gemini_api_order_book_data_source.py:"
@@ -76,7 +80,36 @@ EXPECTED_ORDER_STREAM_DEFINITIONS = {
     "hummingbot/data_feed/liquidations_feed/liquidations_base.py:LiquidationsBase._on_order_stream_interruption",
 }
 
+EXPECTED_DELEGATED_LIFECYCLE_IMPLEMENTATIONS = {
+    "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
+    "BybitPerpetualAPIOrderBookDataSource._run_subscription_tasks",
+    "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
+    "BybitPerpetualAPIOrderBookDataSource._listen_for_subscriptions_on_url",
+    "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
+    "BybitPerpetualAPIOrderBookDataSource._get_connected_websocket_assistant",
+    "hummingbot/data_feed/candles_feed/bitget_perpetual_candles/bitget_perpetual_candles.py:"
+    "BitgetPerpetualCandles._process_websocket_messages",
+    "hummingbot/data_feed/candles_feed/bitget_spot_candles/bitget_spot_candles.py:"
+    "BitgetSpotCandles._process_websocket_messages",
+    "hummingbot/data_feed/candles_feed/btc_markets_spot_candles/btc_markets_spot_candles.py:"
+    "BtcMarketsSpotCandles.start_network",
+    "hummingbot/data_feed/candles_feed/btc_markets_spot_candles/btc_markets_spot_candles.py:"
+    "BtcMarketsSpotCandles.stop_network",
+    "hummingbot/data_feed/candles_feed/btc_markets_spot_candles/btc_markets_spot_candles.py:"
+    "BtcMarketsSpotCandles._polling_loop",
+    "hummingbot/data_feed/candles_feed/btc_markets_spot_candles/btc_markets_spot_candles.py:"
+    "BtcMarketsSpotCandles._on_polling_generation_interruption",
+    "hummingbot/data_feed/candles_feed/candles_base.py:CandlesBase._on_candle_generation_interruption",
+    "hummingbot/connector/exchange/injective_v2/data_sources/injective_data_source.py:InjectiveDataSource.start",
+    "hummingbot/connector/exchange/xrpl/xrpl_api_order_book_data_source.py:"
+    "XRPLAPIOrderBookDataSource._process_websocket_messages_for_pair",
+    "hummingbot/core/utils/async_utils.py:await_primary_then_cleanup",
+    "hummingbot/core/utils/async_utils.py:safe_gather",
+}
+
 ALTERNATE_LIFECYCLE_BOUNDARIES = {
+    "hummingbot/connector/derivative/bitget_perpetual/bitget_perpetual_api_order_book_data_source.py:"
+    "BitgetPerpetualAPIOrderBookDataSource.listen_for_subscriptions": {"await_primary_then_cleanup"},
     "hummingbot/core/data_type/order_book_tracker_data_source.py:"
     "OrderBookTrackerDataSource.listen_for_subscriptions": {"await_primary_then_cleanup"},
     "hummingbot/data_feed/candles_feed/candles_base.py:"
@@ -84,28 +117,131 @@ ALTERNATE_LIFECYCLE_BOUNDARIES = {
     "hummingbot/data_feed/candles_feed/candles_base.py:"
     "CandlesBase._on_order_stream_interruption": {"_on_candle_generation_interruption"},
     "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
-    "BybitPerpetualAPIOrderBookDataSource.listen_for_subscriptions": {"_run_subscription_tasks"},
+    "BybitPerpetualAPIOrderBookDataSource.listen_for_subscriptions": {"await_primary_then_cleanup"},
+    "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
+    "BybitPerpetualAPIOrderBookDataSource._run_subscription_tasks": {"tasks_future"},
+    "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
+    "BybitPerpetualAPIOrderBookDataSource._listen_for_subscriptions_on_url": {
+        "_get_connected_websocket_assistant",
+        "disconnect",
+    },
     "hummingbot/connector/derivative/injective_v2_perpetual/"
     "injective_v2_perpetual_api_order_book_data_source.py:"
-    "InjectiveV2PerpetualAPIOrderBookDataSource.listen_for_subscriptions": {"start"},
+    "InjectiveV2PerpetualAPIOrderBookDataSource.listen_for_subscriptions": {"await_primary_then_cleanup"},
     "hummingbot/connector/exchange/bing_x/bing_x_api_order_book_data_source.py:"
     "BingXAPIOrderBookDataSource.listen_for_subscriptions": {"await_primary_then_cleanup"},
+    "hummingbot/connector/exchange/bitget/bitget_api_order_book_data_source.py:"
+    "BitgetAPIOrderBookDataSource.listen_for_subscriptions": {"await_primary_then_cleanup"},
     "hummingbot/connector/exchange/bybit/bybit_api_order_book_data_source.py:"
     "BybitAPIOrderBookDataSource.listen_for_subscriptions": {"await_primary_then_cleanup"},
     "hummingbot/connector/exchange/injective_v2/injective_v2_api_order_book_data_source.py:"
-    "InjectiveV2APIOrderBookDataSource.listen_for_subscriptions": {"start"},
+    "InjectiveV2APIOrderBookDataSource.listen_for_subscriptions": {"await_primary_then_cleanup"},
     "hummingbot/connector/exchange/xrpl/xrpl_api_order_book_data_source.py:"
-    "XRPLAPIOrderBookDataSource.listen_for_subscriptions": {"safe_gather"},
+    "XRPLAPIOrderBookDataSource.listen_for_subscriptions": {"await_primary_then_cleanup"},
     "hummingbot/data_feed/candles_feed/btc_markets_spot_candles/btc_markets_spot_candles.py:"
-    "BtcMarketsSpotCandles.listen_for_subscriptions": {"start_network"},
+    "BtcMarketsSpotCandles.listen_for_subscriptions": {"start_network", "await_primary_then_cleanup"},
+    "hummingbot/data_feed/candles_feed/btc_markets_spot_candles/btc_markets_spot_candles.py:"
+    "BtcMarketsSpotCandles.start_network": {"stop_network"},
+    "hummingbot/data_feed/candles_feed/btc_markets_spot_candles/btc_markets_spot_candles.py:"
+    "BtcMarketsSpotCandles.stop_network": {"await_primary_then_cleanup"},
+    "hummingbot/data_feed/candles_feed/btc_markets_spot_candles/btc_markets_spot_candles.py:"
+    "BtcMarketsSpotCandles._on_polling_generation_interruption": {"await_primary_then_cleanup"},
     "hummingbot/data_feed/candles_feed/bitget_perpetual_candles/bitget_perpetual_candles.py:"
     "BitgetPerpetualCandles.listen_for_subscriptions": {"listen_for_subscriptions"},
+    "hummingbot/data_feed/candles_feed/bitget_perpetual_candles/bitget_perpetual_candles.py:"
+    "BitgetPerpetualCandles._process_websocket_messages": {"await_primary_then_cleanup"},
     "hummingbot/data_feed/candles_feed/bitget_spot_candles/bitget_spot_candles.py:"
     "BitgetSpotCandles.listen_for_subscriptions": {"listen_for_subscriptions"},
+    "hummingbot/data_feed/candles_feed/bitget_spot_candles/bitget_spot_candles.py:"
+    "BitgetSpotCandles._process_websocket_messages": {"await_primary_then_cleanup"},
+    "hummingbot/data_feed/candles_feed/candles_base.py:"
+    "CandlesBase._on_candle_generation_interruption": {"await_primary_then_cleanup"},
+    "hummingbot/connector/exchange/xrpl/xrpl_api_order_book_data_source.py:"
+    "XRPLAPIOrderBookDataSource._process_websocket_messages_for_pair": {
+        "_close_subscription_connection"
+    },
     "hummingbot/data_feed/candles_feed/lighter_perpetual_candles/lighter_perpetual_candles.py:"
     "LighterPerpetualCandles.listen_for_subscriptions": {"await_primary_then_cleanup"},
     "hummingbot/data_feed/candles_feed/lighter_spot_candles/lighter_spot_candles.py:"
     "LighterSpotCandles.listen_for_subscriptions": {"await_primary_then_cleanup"},
+}
+
+AUDITED_BARE_LIFECYCLE_HELPERS = {
+    "await_primary_then_cleanup": "hummingbot.core.utils.async_utils.await_primary_then_cleanup",
+    "safe_gather": "hummingbot.core.utils.async_utils.safe_gather",
+}
+
+AUDITED_BARE_HELPER_TARGETS = {
+    "await_primary_then_cleanup": "hummingbot/core/utils/async_utils.py:await_primary_then_cleanup",
+    "safe_gather": "hummingbot/core/utils/async_utils.py:safe_gather",
+}
+
+DELEGATED_LIFECYCLE_TARGETS = {
+    (
+        "hummingbot/data_feed/candles_feed/btc_markets_spot_candles/btc_markets_spot_candles.py:"
+        "BtcMarketsSpotCandles.listen_for_subscriptions",
+        "start_network",
+    ): (
+        "hummingbot/data_feed/candles_feed/btc_markets_spot_candles/btc_markets_spot_candles.py:"
+        "BtcMarketsSpotCandles.start_network"
+    ),
+    (
+        "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
+        "BybitPerpetualAPIOrderBookDataSource.listen_for_subscriptions",
+        "_run_subscription_tasks",
+    ): (
+        "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
+        "BybitPerpetualAPIOrderBookDataSource._run_subscription_tasks"
+    ),
+    (
+        "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
+        "BybitPerpetualAPIOrderBookDataSource._listen_for_subscriptions_on_url",
+        "_get_connected_websocket_assistant",
+    ): (
+        "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
+        "BybitPerpetualAPIOrderBookDataSource._get_connected_websocket_assistant"
+    ),
+    (
+        "hummingbot/connector/derivative/injective_v2_perpetual/"
+        "injective_v2_perpetual_api_order_book_data_source.py:"
+        "InjectiveV2PerpetualAPIOrderBookDataSource.listen_for_subscriptions",
+        "start",
+    ): "hummingbot/connector/exchange/injective_v2/data_sources/injective_data_source.py:InjectiveDataSource.start",
+    (
+        "hummingbot/connector/exchange/injective_v2/injective_v2_api_order_book_data_source.py:"
+        "InjectiveV2APIOrderBookDataSource.listen_for_subscriptions",
+        "start",
+    ): "hummingbot/connector/exchange/injective_v2/data_sources/injective_data_source.py:InjectiveDataSource.start",
+    (
+        "hummingbot/data_feed/candles_feed/btc_markets_spot_candles/btc_markets_spot_candles.py:"
+        "BtcMarketsSpotCandles.start_network",
+        "stop_network",
+    ): (
+        "hummingbot/data_feed/candles_feed/btc_markets_spot_candles/btc_markets_spot_candles.py:"
+        "BtcMarketsSpotCandles.stop_network"
+    ),
+    (
+        "hummingbot/data_feed/candles_feed/bitget_perpetual_candles/bitget_perpetual_candles.py:"
+        "BitgetPerpetualCandles.listen_for_subscriptions",
+        "listen_for_subscriptions",
+    ): "hummingbot/data_feed/candles_feed/candles_base.py:CandlesBase.listen_for_subscriptions",
+    (
+        "hummingbot/data_feed/candles_feed/bitget_spot_candles/bitget_spot_candles.py:"
+        "BitgetSpotCandles.listen_for_subscriptions",
+        "listen_for_subscriptions",
+    ): "hummingbot/data_feed/candles_feed/candles_base.py:CandlesBase.listen_for_subscriptions",
+    (
+        "hummingbot/data_feed/candles_feed/candles_base.py:CandlesBase._on_order_stream_interruption",
+        "_on_candle_generation_interruption",
+    ): "hummingbot/data_feed/candles_feed/candles_base.py:CandlesBase._on_candle_generation_interruption",
+    (
+        "hummingbot/connector/exchange/xrpl/xrpl_api_order_book_data_source.py:"
+        "XRPLAPIOrderBookDataSource._process_websocket_messages_for_pair",
+        "_close_subscription_connection",
+    ): (
+        "hummingbot/connector/exchange/xrpl/xrpl_api_order_book_data_source.py:"
+        "XRPLAPIOrderBookDataSource._process_websocket_messages_for_pair"
+    ),
 }
 
 
@@ -116,26 +252,84 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
     def _production_definitions():
         repository_root = Path(__file__).resolve().parents[4]
         definitions = {}
+        direct_definition_names = {
+            "listen_for_subscriptions",
+            "_on_order_stream_interruption",
+        }
+        delegated_definition_names = {
+            definition.rsplit(".", 1)[-1].split(":")[-1]
+            for definition in EXPECTED_DELEGATED_LIFECYCLE_IMPLEMENTATIONS
+        }
+        candidate_definition_names = direct_definition_names | delegated_definition_names
         for path in sorted((repository_root / "hummingbot").rglob("*.py")):
             source = path.read_text(encoding="utf-8")
             if not any(
-                signature in source
-                for signature in (
-                    "async def listen_for_subscriptions",
-                    "async def _on_order_stream_interruption",
-                )
+                f"def {definition_name}(" in source
+                for definition_name in candidate_definition_names
             ):
                 continue
             tree = ast.parse(source, filename=str(path))
+            module_bindings = {}
+
+            class ModuleRebindingVisitor(ast.NodeVisitor):
+                def __init__(self):
+                    self.names = set()
+
+                def visit_Name(self, node):
+                    if isinstance(node.ctx, (ast.Store, ast.Del)):
+                        self.names.add(node.id)
+
+                def visit_AsyncFunctionDef(self, node):
+                    self.names.add(node.name)
+
+                def visit_FunctionDef(self, node):
+                    self.names.add(node.name)
+
+                def visit_ClassDef(self, node):
+                    self.names.add(node.name)
+
+                def visit_Import(self, node):
+                    self.names.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+
+                def visit_ImportFrom(self, node):
+                    self.names.update(alias.asname or alias.name for alias in node.names)
+
+            for node in tree.body:
+                if isinstance(node, ast.ImportFrom) and node.module is not None:
+                    for alias in node.names:
+                        if alias.name == "*":
+                            module_bindings.clear()
+                        else:
+                            module_bindings[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        module_bindings[alias.asname or alias.name.split(".")[0]] = alias.name
+                else:
+                    visitor = ModuleRebindingVisitor()
+                    visitor.visit(node)
+                    for rebound_name in visitor.names:
+                        module_bindings.pop(rebound_name, None)
             relative_path = path.relative_to(repository_root).as_posix()
+            for function_node in (
+                node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
+            ):
+                key = f"{relative_path}:{function_node.name}"
+                if key in EXPECTED_DELEGATED_LIFECYCLE_IMPLEMENTATIONS:
+                    function_node._module_bindings = module_bindings
+                    function_node._definition_key = key
+                    definitions[key] = function_node
             for class_node in (node for node in tree.body if isinstance(node, ast.ClassDef)):
                 for function_node in (
                     node
                     for node in class_node.body
                     if isinstance(node, ast.AsyncFunctionDef)
-                    and node.name in {"listen_for_subscriptions", "_on_order_stream_interruption"}
                 ):
                     key = f"{relative_path}:{class_node.name}.{function_node.name}"
+                    is_direct_definition = function_node.name in direct_definition_names
+                    if not is_direct_definition and key not in EXPECTED_DELEGATED_LIFECYCLE_IMPLEMENTATIONS:
+                        continue
+                    function_node._module_bindings = module_bindings
+                    function_node._definition_key = key
                     definitions[key] = function_node
         return definitions
 
@@ -737,6 +931,322 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             visitor.visit(statement)
         return receivers
 
+    @classmethod
+    def _websocket_receiver_is_owned_at(cls, function_node, receiver_name, boundary_node):
+        initially_owned = {
+            argument.arg
+            for argument in [
+                *function_node.args.posonlyargs,
+                *function_node.args.args,
+                *function_node.args.kwonlyargs,
+            ]
+            if cls._annotation_names_ws_assistant(argument.annotation)
+        }
+        boundary_states = []
+        observed_states = []
+        parents = {
+            child: parent
+            for parent in ast.walk(function_node)
+            for child in ast.iter_child_nodes(parent)
+        }
+
+        def none_marker(name):
+            return ("definitely_none", name)
+
+        def assigned_names(target):
+            if isinstance(target, ast.Name):
+                return {target.id}
+            if isinstance(target, (ast.Tuple, ast.List)):
+                return set().union(*(assigned_names(element) for element in target.elts))
+            if isinstance(target, ast.Starred):
+                return assigned_names(target.value)
+            return set()
+
+        def value_status(value, owned_receivers):
+            value = value.value if isinstance(value, ast.Await) else value
+            if isinstance(value, ast.Name):
+                if value.id in owned_receivers:
+                    return "owned"
+                if none_marker(value.id) in owned_receivers:
+                    return "none"
+                return "unknown"
+            if isinstance(value, ast.Constant) and value.value is None:
+                return "none"
+            if (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr in {
+                    "get_ws_assistant",
+                    "_connected_websocket_assistant",
+                    "_get_connected_websocket_assistant",
+                }
+            ):
+                return "owned"
+            return "unknown"
+
+        def bind_names(owned_receivers, names, status):
+            updated = set(owned_receivers)
+            for name in names:
+                updated.discard(name)
+                updated.discard(none_marker(name))
+                if status == "owned":
+                    updated.add(name)
+                elif status == "none":
+                    updated.add(none_marker(name))
+            return frozenset(updated)
+
+        def bind_target(owned_receivers, target, status):
+            return bind_names(owned_receivers, assigned_names(target), status)
+
+        def contains_boundary(node):
+            return any(candidate is boundary_node for candidate in ast.walk(node))
+
+        def record_boundary(states, statement):
+            if not contains_boundary(statement):
+                return
+            reaching_states = set(states)
+            ancestor = boundary_node
+            while ancestor is not statement:
+                ancestor = parents.get(ancestor)
+                if ancestor is None:
+                    break
+                if not isinstance(ancestor, ast.IfExp):
+                    continue
+                test = ancestor.test
+                if not (
+                    isinstance(test, ast.Compare)
+                    and len(test.ops) == 1
+                    and isinstance(test.left, ast.Name)
+                    and test.left.id == receiver_name
+                    and len(test.comparators) == 1
+                    and isinstance(test.comparators[0], ast.Constant)
+                    and test.comparators[0].value is None
+                ):
+                    continue
+                boundary_is_in_body = contains_boundary(ancestor.body)
+                if isinstance(test.ops[0], ast.IsNot):
+                    want_none = not boundary_is_in_body
+                elif isinstance(test.ops[0], ast.Is):
+                    want_none = boundary_is_in_body
+                else:
+                    continue
+                if want_none:
+                    reaching_states = {
+                        state for state in reaching_states if none_marker(receiver_name) in state
+                    }
+                else:
+                    reaching_states = {
+                        state for state in reaching_states if none_marker(receiver_name) not in state
+                    }
+            boundary_states.extend(reaching_states)
+            # Be conservative about same-expression rebinding. Evaluation order is
+            # analyzed for exception closure below; identity proof must not accept a
+            # receiver that may be rebound anywhere in the boundary expression.
+            for candidate in ast.walk(statement):
+                if isinstance(candidate, ast.NamedExpr):
+                    names = assigned_names(candidate.target)
+                    if receiver_name in names:
+                        boundary_states.extend(
+                            bind_names(state, names, value_status(candidate.value, state))
+                            for state in states
+                        )
+
+        def apply_named_expressions(node, states):
+            updated = set(states)
+            for candidate in ast.walk(node):
+                if not isinstance(candidate, ast.NamedExpr):
+                    continue
+                next_states = set()
+                for state in updated:
+                    next_states.add(
+                        bind_target(state, candidate.target, value_status(candidate.value, state))
+                    )
+                updated = next_states
+            return updated
+
+        def block_paths(statements, incoming):
+            paths = set(incoming)
+            for statement in statements:
+                completed = {(control, state) for control, state in paths if control != "fallthrough"}
+                active = {state for control, state in paths if control == "fallthrough"}
+                if not active:
+                    return completed
+                paths = completed | statement_paths(statement, active)
+            return paths
+
+        def apply_finally(protected_paths, finalbody):
+            finalized = set()
+            for protected_control, protected_state in protected_paths:
+                final_paths = block_paths(finalbody, {("fallthrough", protected_state)})
+                for final_control, final_state in final_paths:
+                    finalized.add(
+                        (
+                            protected_control if final_control == "fallthrough" else final_control,
+                            final_state,
+                        )
+                    )
+            return finalized
+
+        def statement_paths(node, states):
+            observed_states.extend(states)
+            record_boundary(states, node)
+
+            if isinstance(node, ast.Assign):
+                updated = set()
+                for state in states:
+                    next_state = state
+                    status = value_status(node.value, state)
+                    for target in node.targets:
+                        next_state = bind_target(next_state, target, status)
+                    updated.add(next_state)
+                return {("fallthrough", state) for state in updated}
+            if isinstance(node, ast.AnnAssign):
+                return {
+                    (
+                        "fallthrough",
+                        bind_target(
+                            state,
+                            node.target,
+                            value_status(node.value, state) if node.value is not None else "unknown",
+                        ),
+                    )
+                    for state in states
+                }
+            if isinstance(node, (ast.AugAssign, ast.Delete)):
+                targets = [node.target] if isinstance(node, ast.AugAssign) else node.targets
+                return {
+                    (
+                        "fallthrough",
+                        bind_names(
+                            state,
+                            set().union(*(assigned_names(target) for target in targets)),
+                            "unknown",
+                        ),
+                    )
+                    for state in states
+                }
+            if isinstance(node, ast.Return):
+                return {("return", state) for state in apply_named_expressions(node, states)}
+            if isinstance(node, ast.Raise):
+                return {("raise", state) for state in apply_named_expressions(node, states)}
+            if isinstance(node, ast.Break):
+                return {("break", state) for state in states}
+            if isinstance(node, ast.Continue):
+                return {("continue", state) for state in states}
+            if isinstance(node, ast.If):
+                branch_states = apply_named_expressions(node.test, states)
+                truth = cls._literal_truth_value(node.test)
+                paths = set()
+                if truth is not False:
+                    paths.update(block_paths(node.body, {("fallthrough", state) for state in branch_states}))
+                if truth is not True:
+                    paths.update(block_paths(node.orelse, {("fallthrough", state) for state in branch_states}))
+                return paths
+            if isinstance(node, ast.While):
+                loop_states = apply_named_expressions(node.test, states)
+                truth = cls._literal_truth_value(node.test)
+                if truth is False:
+                    return block_paths(node.orelse, {("fallthrough", state) for state in loop_states})
+                body = block_paths(node.body, {("fallthrough", state) for state in loop_states})
+                paths = {
+                    (control, state)
+                    for control, state in body
+                    if control in {"return", "raise"}
+                }
+                paths.update(("fallthrough", state) for control, state in body if control == "break")
+                if truth is not True:
+                    completion_states = set(loop_states)
+                    completion_states.update(
+                        state for control, state in body if control in {"fallthrough", "continue"}
+                    )
+                    paths.update(
+                        block_paths(node.orelse, {("fallthrough", state) for state in completion_states})
+                    )
+                return paths
+            if isinstance(node, (ast.For, ast.AsyncFor)):
+                iterable_states = apply_named_expressions(node.iter, states)
+                body_states = {
+                    bind_target(state, node.target, "unknown")
+                    for state in iterable_states
+                }
+                body = block_paths(node.body, {("fallthrough", state) for state in body_states})
+                paths = {
+                    (control, state)
+                    for control, state in body
+                    if control in {"return", "raise"}
+                }
+                paths.update(("fallthrough", state) for control, state in body if control == "break")
+                completion_states = set(iterable_states)
+                completion_states.update(
+                    state for control, state in body if control in {"fallthrough", "continue"}
+                )
+                paths.update(
+                    block_paths(node.orelse, {("fallthrough", state) for state in completion_states})
+                )
+                return paths
+            if isinstance(node, ast.Try):
+                observation_start = len(observed_states)
+                body = block_paths(node.body, {("fallthrough", state) for state in states})
+                exceptional_states = set(states) | set(observed_states[observation_start:])
+                protected = {(control, state) for control, state in body if control != "fallthrough"}
+                normal = {state for control, state in body if control == "fallthrough"}
+                if node.orelse:
+                    protected.update(block_paths(node.orelse, {("fallthrough", state) for state in normal}))
+                else:
+                    protected.update(("fallthrough", state) for state in normal)
+                raised = {
+                    state for control, state in body if control == "raise"
+                } | exceptional_states
+                for handler in node.handlers:
+                    protected.update(block_paths(handler.body, {("fallthrough", state) for state in raised}))
+                if node.finalbody:
+                    protected.update(("raise", state) for state in exceptional_states)
+                return apply_finally(protected, node.finalbody) if node.finalbody else protected
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                body_states = set(states)
+                for item in node.items:
+                    body_states = apply_named_expressions(item.context_expr, body_states)
+                    if item.optional_vars is not None:
+                        body_states = {
+                            bind_target(state, item.optional_vars, "unknown")
+                            for state in body_states
+                        }
+                return block_paths(node.body, {("fallthrough", state) for state in body_states})
+            if isinstance(node, ast.Match):
+                subject_states = apply_named_expressions(node.subject, states)
+                paths = set()
+                exhaustive = False
+                for case in node.cases:
+                    case_states = apply_named_expressions(case.guard, subject_states)
+                    paths.update(block_paths(case.body, {("fallthrough", state) for state in case_states}))
+                    exhaustive = exhaustive or cls._is_irrefutable_match_pattern(case.pattern)
+                if not exhaustive:
+                    paths.update(("fallthrough", state) for state in subject_states)
+                return paths
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef, ast.ClassDef)):
+                return {
+                    ("fallthrough", bind_names(state, {node.name}, "unknown"))
+                    for state in states
+                }
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                names = {
+                    alias.asname or (alias.name.split(".")[0] if isinstance(node, ast.Import) else alias.name)
+                    for alias in node.names
+                }
+                return {
+                    ("fallthrough", bind_names(state, names, "unknown"))
+                    for state in states
+                }
+            return {
+                ("fallthrough", state)
+                for state in apply_named_expressions(node, states)
+            }
+
+        block_paths(function_node.body, {("fallthrough", frozenset(initially_owned))})
+        return bool(boundary_states) and all(
+            receiver_name in state for state in boundary_states
+        )
+
     @staticmethod
     def _function_argument_bindings(function_node):
         bindings = {
@@ -900,18 +1410,28 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             if function_name == "tasks_future":
                 return cls._is_valid_tasks_future(function_node, node)
             return (
-                function_name in {"await_primary_then_cleanup", "safe_gather"}
+                function_name in AUDITED_BARE_LIFECYCLE_HELPERS
                 and function_name not in cls._function_local_bindings(function_node)
+                and getattr(function_node, "_module_bindings", {}).get(function_name)
+                == AUDITED_BARE_LIFECYCLE_HELPERS[function_name]
+                and AUDITED_BARE_HELPER_TARGETS[function_name]
+                in EXPECTED_DELEGATED_LIFECYCLE_IMPLEMENTATIONS
             )
         if not isinstance(function, ast.Attribute):
             return False
         if function_name == "disconnect":
             return (
                 isinstance(function.value, ast.Name)
-                and function.value.id in cls._permitted_websocket_receivers(function_node)
+                and cls._websocket_receiver_is_owned_at(function_node, function.value.id, node)
             )
         if function_name == "_on_order_stream_interruption":
             return cls._is_direct_self_or_super_receiver(function_node, function.value)
+        definition = getattr(function_node, "_definition_key", None)
+        target = DELEGATED_LIFECYCLE_TARGETS.get((definition, function_name))
+        if target is None or target not in (
+            EXPECTED_ORDER_STREAM_DEFINITIONS | EXPECTED_DELEGATED_LIFECYCLE_IMPLEMENTATIONS
+        ):
+            return False
         if function_name == "start":
             return (
                 isinstance(function.value, ast.Attribute)
@@ -1024,31 +1544,6 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                         finalized.add((final_control, final_seen))
             return finalized
 
-        def scoped_awaits(statements):
-            awaits = []
-
-            class AwaitVisitor(ast.NodeVisitor):
-                def visit_Await(self, node):
-                    awaits.append(node)
-                    self.generic_visit(node)
-
-                def visit_AsyncFunctionDef(self, node):
-                    return None
-
-                def visit_FunctionDef(self, node):
-                    return None
-
-                def visit_Lambda(self, node):
-                    return None
-
-                def visit_ClassDef(self, node):
-                    return None
-
-            visitor = AwaitVisitor()
-            for statement in statements:
-                visitor.visit(statement)
-            return awaits
-
         def statement_paths(node, seen):
             if isinstance(node, ast.Expr):
                 return {("fallthrough", seen or expression_guarantees_boundary(node.value))}
@@ -1123,18 +1618,13 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             if isinstance(node, ast.Try):
                 body = block_paths(node.body, {("fallthrough", seen)})
                 protected = {(control, value) for control, value in body if control != "fallthrough"}
-                possible_await_raises = {
-                    seen or cls._is_lifecycle_boundary_await(function_node, await_node, expected_names)
-                    for await_node in scoped_awaits(node.body)
-                }
-                protected.update(("raise", value) for value in possible_await_raises)
                 normal = {value for control, value in body if control == "fallthrough"}
                 if node.orelse:
                     protected.update(block_paths(node.orelse, {("fallthrough", value) for value in normal}))
                 else:
                     protected.update(("fallthrough", value) for value in normal)
 
-                raised = {value for control, value in body if control == "raise"} | possible_await_raises
+                raised = {value for control, value in body if control == "raise"}
                 for handler in node.handlers:
                     for value in raised:
                         protected.update(block_paths(handler.body, {("fallthrough", value)}))
@@ -1180,6 +1670,318 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
 
         terminal_paths = block_paths(function_node.body, {("fallthrough", False)})
         return bool(terminal_paths) and all(seen for _, seen in terminal_paths)
+
+    @classmethod
+    def _preboundary_exception_paths_are_closed(cls, definition, function_node):
+        """Model evaluation order so exceptions cannot skip the first lifecycle boundary."""
+        expected_names = cls._expected_lifecycle_boundary_names(definition, function_node)
+        local_async_functions = {
+            node.name
+            for node in cls._executable_body_nodes(function_node)
+            if isinstance(node, ast.AsyncFunctionDef)
+        }
+
+        def sequence(expressions, incoming):
+            paths = {("fallthrough", incoming)}
+            for expression in expressions:
+                completed = {(control, seen) for control, seen in paths if control != "fallthrough"}
+                active = {seen for control, seen in paths if control == "fallthrough"}
+                paths = completed
+                for seen in active:
+                    paths.update(expression_paths(expression, seen))
+            return paths
+
+        def call_prefix_paths(call, seen):
+            expressions = []
+            if isinstance(call.func, ast.Attribute):
+                expressions.append(call.func.value)
+            elif not isinstance(call.func, ast.Name):
+                expressions.append(call.func)
+            expressions.extend(call.args)
+            expressions.extend(keyword.value for keyword in call.keywords)
+            return sequence(expressions, seen)
+
+        def safe_coroutine_creation(call):
+            function = call.func
+            if isinstance(function, ast.Name):
+                return function.id in local_async_functions or (
+                    function.id == "super"
+                    and "super" not in cls._function_local_bindings(function_node)
+                    and not call.args
+                    and not call.keywords
+                )
+            if not isinstance(function, ast.Attribute):
+                return False
+            receiver = function.value
+            if cls._is_direct_self_or_super_receiver(function_node, receiver):
+                return True
+            if isinstance(receiver, ast.Name):
+                return cls._websocket_receiver_is_owned_at(function_node, receiver.id, call)
+            return False
+
+        def expression_paths(node, seen):
+            if node is None:
+                return {("fallthrough", seen)}
+            if isinstance(node, ast.Await):
+                if cls._is_lifecycle_boundary_await(function_node, node, expected_names):
+                    call = node.value
+                    paths = call_prefix_paths(call, seen)
+                    completed = {(control, value) for control, value in paths if control != "fallthrough"}
+                    for _control, _value in paths - completed:
+                        completed.add(("fallthrough", True))
+                        completed.add(("raise", True))
+                    return completed
+                paths = expression_paths(node.value, seen)
+                completed = {(control, value) for control, value in paths if control != "fallthrough"}
+                for _control, value in paths - completed:
+                    completed.add(("fallthrough", value))
+                    completed.add(("raise", value))
+                return completed
+            if isinstance(node, ast.Call):
+                paths = call_prefix_paths(node, seen)
+                completed = {(control, value) for control, value in paths if control != "fallthrough"}
+                for _control, value in paths - completed:
+                    completed.add(("fallthrough", value))
+                    if not safe_coroutine_creation(node):
+                        completed.add(("raise", value))
+                return completed
+            if isinstance(node, ast.Attribute):
+                paths = expression_paths(node.value, seen)
+                if isinstance(node.value, ast.Name) and node.value.id in {
+                    "self", "asyncio", "CONSTANTS", "web_utils"
+                }:
+                    return paths
+                completed = {(control, value) for control, value in paths if control != "fallthrough"}
+                for _control, value in paths - completed:
+                    completed.add(("fallthrough", value))
+                    completed.add(("raise", value))
+                return completed
+            if isinstance(node, (ast.Name, ast.Constant)):
+                return {("fallthrough", seen)}
+            if isinstance(node, ast.NamedExpr):
+                return expression_paths(node.value, seen)
+            if isinstance(node, ast.UnaryOp):
+                return expression_paths(node.operand, seen)
+            if isinstance(node, ast.BoolOp):
+                paths = expression_paths(node.values[0], seen)
+                for value_node in node.values[1:]:
+                    previous = {(control, value) for control, value in paths if control != "fallthrough"}
+                    active = {value for control, value in paths if control == "fallthrough"}
+                    paths = previous | {("fallthrough", value) for value in active}
+                    for value in active:
+                        paths.update(expression_paths(value_node, value))
+                return paths
+            if isinstance(node, ast.IfExp):
+                test_paths = expression_paths(node.test, seen)
+                paths = {(control, value) for control, value in test_paths if control != "fallthrough"}
+                truth = cls._literal_truth_value(node.test)
+                for _control, value in test_paths - paths:
+                    if truth is not False:
+                        paths.update(expression_paths(node.body, value))
+                    if truth is not True:
+                        paths.update(expression_paths(node.orelse, value))
+                return paths
+            if isinstance(node, ast.Lambda):
+                return sequence(
+                    [*node.args.defaults, *(default for default in node.args.kw_defaults if default is not None)],
+                    seen,
+                )
+            if isinstance(node, ast.GeneratorExp):
+                return expression_paths(node.generators[0].iter, seen) if node.generators else {
+                    ("fallthrough", seen)
+                }
+            if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp)):
+                if not node.generators:
+                    return {("fallthrough", seen)}
+                # The outer iterable and iterator protocol are eager. The body may run
+                # zero times, so no body boundary can dominate construction.
+                paths = expression_paths(node.generators[0].iter, seen)
+                completed = {(control, value) for control, value in paths if control != "fallthrough"}
+                for _control, value in paths - completed:
+                    completed.add(("fallthrough", value))
+                    completed.add(("raise", value))
+                return completed
+            if isinstance(node, ast.Dict):
+                expressions = []
+                for key, value in zip(node.keys, node.values):
+                    if key is not None:
+                        expressions.append(key)
+                    expressions.append(value)
+                return sequence(expressions, seen)
+            if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+                return sequence(node.elts, seen)
+            if isinstance(node, ast.Compare):
+                paths = expression_paths(node.left, seen)
+                for operator, comparator in zip(node.ops, node.comparators):
+                    completed = {(control, value) for control, value in paths if control != "fallthrough"}
+                    active = {value for control, value in paths if control == "fallthrough"}
+                    paths = completed | {("fallthrough", value) for value in active}
+                    for value in active:
+                        paths.update(expression_paths(comparator, value))
+                        if not isinstance(operator, (ast.Is, ast.IsNot)):
+                            paths.add(("raise", value))
+                return paths
+            if isinstance(node, (ast.BinOp, ast.Subscript)):
+                expressions = [node.left, node.right] if isinstance(node, ast.BinOp) else [node.value, node.slice]
+                paths = sequence(expressions, seen)
+                completed = {(control, value) for control, value in paths if control != "fallthrough"}
+                for _control, value in paths - completed:
+                    completed.add(("fallthrough", value))
+                    completed.add(("raise", value))
+                return completed
+            children = [child for child in ast.iter_child_nodes(node) if isinstance(child, ast.expr)]
+            return sequence(children, seen)
+
+        def block_paths(statements, incoming):
+            paths = set(incoming)
+            for statement in statements:
+                completed = {(control, seen) for control, seen in paths if control != "fallthrough"}
+                active = {seen for control, seen in paths if control == "fallthrough"}
+                if not active:
+                    return completed
+                paths = completed
+                for seen in active:
+                    paths.update(statement_paths(statement, seen))
+            return paths
+
+        def apply_finally(protected_paths, finalbody):
+            finalized = set()
+            for protected_control, protected_seen in protected_paths:
+                final_paths = block_paths(finalbody, {("fallthrough", protected_seen)})
+                for final_control, final_seen in final_paths:
+                    finalized.add(
+                        (protected_control if final_control == "fallthrough" else final_control, final_seen)
+                    )
+            return finalized
+
+        def statement_paths(node, seen):
+            if isinstance(node, ast.Expr):
+                return expression_paths(node.value, seen)
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                return expression_paths(node.value, seen)
+            if isinstance(node, ast.Return):
+                return {
+                    ("return" if control == "fallthrough" else control, value)
+                    for control, value in expression_paths(node.value, seen)
+                }
+            if isinstance(node, ast.Raise):
+                return {
+                    ("raise", value)
+                    for _control, value in expression_paths(node.exc, seen)
+                }
+            if isinstance(node, ast.Break):
+                return {("break", seen)}
+            if isinstance(node, ast.Continue):
+                return {("continue", seen)}
+            if isinstance(node, ast.If):
+                test_paths = expression_paths(node.test, seen)
+                paths = {(control, value) for control, value in test_paths if control != "fallthrough"}
+                truth = cls._literal_truth_value(node.test)
+                for _control, value in test_paths - paths:
+                    if truth is not False:
+                        paths.update(block_paths(node.body, {("fallthrough", value)}))
+                    if truth is not True:
+                        paths.update(block_paths(node.orelse, {("fallthrough", value)}))
+                return paths
+            if isinstance(node, ast.While):
+                test_paths = expression_paths(node.test, seen)
+                paths = {(control, value) for control, value in test_paths if control != "fallthrough"}
+                truth = cls._literal_truth_value(node.test)
+                for _control, value in test_paths - paths:
+                    if truth is not False:
+                        body = block_paths(node.body, {("fallthrough", value)})
+                        paths.update((control, body_seen) for control, body_seen in body if control in {"return", "raise"})
+                        paths.update(("fallthrough", body_seen) for control, body_seen in body if control == "break")
+                    if truth is not True:
+                        paths.update(block_paths(node.orelse, {("fallthrough", value)}))
+                return paths
+            if isinstance(node, (ast.For, ast.AsyncFor)):
+                iterable_paths = expression_paths(node.iter, seen)
+                paths = {(control, value) for control, value in iterable_paths if control != "fallthrough"}
+                for _control, value in iterable_paths - paths:
+                    paths.add(("raise", value))
+                    paths.update(block_paths(node.orelse, {("fallthrough", value)}))
+                    body = block_paths(node.body, {("fallthrough", value)})
+                    paths.update((control, body_seen) for control, body_seen in body if control in {"return", "raise"})
+                    paths.update(("fallthrough", body_seen) for control, body_seen in body if control == "break")
+                return paths
+            if isinstance(node, ast.Try):
+                body = block_paths(node.body, {("fallthrough", seen)})
+                protected = {(control, value) for control, value in body if control != "fallthrough"}
+                normal = {value for control, value in body if control == "fallthrough"}
+                if node.orelse:
+                    protected.update(block_paths(node.orelse, {("fallthrough", value) for value in normal}))
+                else:
+                    protected.update(("fallthrough", value) for value in normal)
+                raised = {value for control, value in body if control == "raise"}
+                for handler in node.handlers:
+                    protected.update(block_paths(handler.body, {("fallthrough", value) for value in raised}))
+                if node.finalbody:
+                    protected = apply_finally(protected, node.finalbody)
+                return protected
+            if isinstance(node, ast.Match):
+                subject_paths = expression_paths(node.subject, seen)
+                paths = {(control, value) for control, value in subject_paths if control != "fallthrough"}
+                for _control, value in subject_paths - paths:
+                    exhaustive = False
+                    for case in node.cases:
+                        guard_paths = expression_paths(case.guard, value)
+                        paths.update((control, guard_seen) for control, guard_seen in guard_paths if control != "fallthrough")
+                        for _guard_control, guard_seen in guard_paths:
+                            if _guard_control == "fallthrough":
+                                paths.update(block_paths(case.body, {("fallthrough", guard_seen)}))
+                        exhaustive = exhaustive or (
+                            cls._is_irrefutable_match_pattern(case.pattern)
+                            and cls._literal_truth_value(case.guard) is not False
+                        )
+                    if not exhaustive:
+                        paths.add(("fallthrough", value))
+                return paths
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                paths = {("fallthrough", seen)}
+                for item in node.items:
+                    next_paths = set()
+                    for control, value in paths:
+                        if control != "fallthrough":
+                            next_paths.add((control, value))
+                            continue
+                        context_paths = expression_paths(item.context_expr, value)
+                        next_paths.update(context_paths)
+                        for context_control, context_seen in context_paths:
+                            if context_control == "fallthrough":
+                                # __enter__/__aenter__ runs before the body and can fail.
+                                next_paths.add(("raise", context_seen))
+                    paths = next_paths
+                body_paths = set()
+                for control, value in paths:
+                    if control == "fallthrough":
+                        body_paths.update(block_paths(node.body, {("fallthrough", value)}))
+                    else:
+                        body_paths.add((control, value))
+                # Every successfully-entered manager exits after the body and may fail.
+                body_paths.update(("raise", value) for _control, value in list(body_paths))
+                return body_paths
+            if isinstance(node, ast.Assert):
+                if not __debug__:
+                    return {("fallthrough", seen)}
+                paths = expression_paths(node.test, seen)
+                paths.update(("raise", value) for control, value in paths if control == "fallthrough")
+                return paths
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                return sequence(
+                    [
+                        *node.decorator_list,
+                        *node.args.defaults,
+                        *(default for default in node.args.kw_defaults if default is not None),
+                    ],
+                    seen,
+                )
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                return {("fallthrough", seen), ("raise", seen)}
+            return {("fallthrough", seen)}
+
+        terminal_paths = block_paths(function_node.body, {("fallthrough", False)})
+        return all(seen for control, seen in terminal_paths if control == "raise")
 
     @classmethod
     def _is_owned_task_cleanup(cls, node):
@@ -1241,6 +2043,7 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
         return False
 
     def _audit_definition(self, definition, function_node):
+        function_node._definition_key = definition
         executable_nodes = self._executable_body_nodes(function_node)
         for node in executable_nodes:
             if isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -1259,6 +2062,10 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
             self._lifecycle_boundary_dominates_paths(definition, function_node),
             f"{definition} must execute a recognized awaited lifecycle boundary on every path",
         )
+        self.assertTrue(
+            self._preboundary_exception_paths_are_closed(definition, function_node),
+            f"{definition} must execute a recognized awaited lifecycle boundary on every path",
+        )
 
         disconnect_awaits = [
             node for node in executable_nodes if self._is_disconnect_boundary_await(function_node, node)
@@ -1273,16 +2080,70 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
                     f"{definition} must protect post-disconnect task cleanup with finally",
                 )
 
+    def _audit_delegated_definition(self, definition, function_node):
+        structural_contracts = {
+            "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
+            "BybitPerpetualAPIOrderBookDataSource._run_subscription_tasks": (
+                "asyncio.gather",
+                "tasks_future.cancel",
+            ),
+            "hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_api_order_book_data_source.py:"
+            "BybitPerpetualAPIOrderBookDataSource._get_connected_websocket_assistant": (
+                "disconnect",
+                "BaseException",
+            ),
+            "hummingbot/data_feed/candles_feed/btc_markets_spot_candles/btc_markets_spot_candles.py:"
+            "BtcMarketsSpotCandles._polling_loop": ("finally", "_is_running"),
+            "hummingbot/data_feed/candles_feed/bitget_spot_candles/bitget_spot_candles.py:"
+            "BitgetSpotCandles._process_websocket_messages": (
+                "wait_until_released",
+                "await_primary_then_cleanup",
+                "end_generation",
+            ),
+            "hummingbot/data_feed/candles_feed/bitget_perpetual_candles/bitget_perpetual_candles.py:"
+            "BitgetPerpetualCandles._process_websocket_messages": (
+                "wait_until_released",
+                "await_primary_then_cleanup",
+                "end_generation",
+            ),
+            "hummingbot/connector/exchange/injective_v2/data_sources/injective_data_source.py:"
+            "InjectiveDataSource.start": ("add_listening_task", "asyncio.create_task"),
+            "hummingbot/connector/exchange/xrpl/xrpl_api_order_book_data_source.py:"
+            "XRPLAPIOrderBookDataSource._process_websocket_messages_for_pair": (
+                "finally",
+                "_close_subscription_connection",
+            ),
+            "hummingbot/core/utils/async_utils.py:await_primary_then_cleanup": (
+                "await cleanup()",
+                "raise cleanup_cancellation",
+            ),
+            "hummingbot/core/utils/async_utils.py:safe_gather": ("await asyncio.gather", "raise"),
+        }
+        required_fragments = structural_contracts.get(definition)
+        if required_fragments is None:
+            self._audit_definition(definition, function_node)
+            return
+
+        source = ast.unparse(function_node)
+        for fragment in required_fragments:
+            self.assertIn(fragment, source, f"{definition} must retain its audited delegated contract")
+
     def test_all_order_stream_definitions_obey_interruption_ownership_boundaries(self):
         definitions = self._production_definitions()
-        self.assertEqual(EXPECTED_ORDER_STREAM_DEFINITIONS, set(definitions))
-        self.assertEqual(25, len(definitions))
+        expected_definitions = (
+            EXPECTED_ORDER_STREAM_DEFINITIONS | EXPECTED_DELEGATED_LIFECYCLE_IMPLEMENTATIONS
+        )
+        self.assertEqual(expected_definitions, set(definitions))
+        self.assertEqual(len(expected_definitions), len(definitions))
 
         audited_definitions = set()
         for definition, function_node in definitions.items():
             audited_definitions.add(definition)
-            self._audit_definition(definition, function_node)
-        self.assertEqual(EXPECTED_ORDER_STREAM_DEFINITIONS, audited_definitions)
+            if definition in EXPECTED_DELEGATED_LIFECYCLE_IMPLEMENTATIONS:
+                self._audit_delegated_definition(definition, function_node)
+            else:
+                self._audit_definition(definition, function_node)
+        self.assertEqual(expected_definitions, audited_definitions)
 
     def test_static_audit_rejects_listener_without_awaited_lifecycle_boundary(self):
         function_node = ast.parse(
@@ -1383,6 +2244,71 @@ class OrderStreamOverrideStaticTests(unittest.TestCase):
 
         with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
             self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+    def test_static_audit_rejects_remaining_reviewer_execution_order_probes(self):
+        sources = {
+            "await raises before boundary": (
+                "async def listen_for_subscriptions(self):\n"
+                "    await self._sleep(0)\n"
+                "    await self._on_order_stream_interruption()\n"
+            ),
+            "boundary argument raises": (
+                "async def listen_for_subscriptions(self, make_argument):\n"
+                "    await self._on_order_stream_interruption(make_argument())\n"
+            ),
+            "websocket receiver rebound": (
+                "async def listen_for_subscriptions(self):\n"
+                "    websocket = await self._connected_websocket_assistant()\n"
+                "    websocket = object()\n"
+                "    await websocket.disconnect()\n"
+            ),
+            "unresolved bare helper": (
+                "async def listen_for_subscriptions(self):\n"
+                "    await await_primary_then_cleanup(None, None, None, 'cleanup')\n"
+            ),
+            "with entry can skip body boundary": (
+                "async def listen_for_subscriptions(self, manager):\n"
+                "    with manager():\n"
+                "        await self._on_order_stream_interruption()\n"
+            ),
+            "async with entry can skip body boundary": (
+                "async def listen_for_subscriptions(self, manager):\n"
+                "    async with manager():\n"
+                "        await self._on_order_stream_interruption()\n"
+            ),
+        }
+
+        for name, source in sources.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+                    self._audit_definition(
+                        "mutated:Listener.listen_for_subscriptions",
+                        ast.parse(source).body[0],
+                    )
+
+    def test_static_audit_tracks_websocket_identity_per_path(self):
+        function_node = ast.parse(
+            "async def listen_for_subscriptions(self, use_assistant):\n"
+            "    if use_assistant:\n"
+            "        websocket = await self._connected_websocket_assistant()\n"
+            "    else:\n"
+            "        websocket = object()\n"
+            "    await websocket.disconnect()\n"
+        ).body[0]
+
+        with self.assertRaisesRegex(AssertionError, "awaited lifecycle boundary"):
+            self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
+
+    def test_static_audit_applies_finally_to_preboundary_exception_paths(self):
+        function_node = ast.parse(
+            "async def listen_for_subscriptions(self):\n"
+            "    try:\n"
+            "        await self._sleep(0)\n"
+            "    finally:\n"
+            "        await self._on_order_stream_interruption()\n"
+        ).body[0]
+
+        self._audit_definition("mutated:Listener.listen_for_subscriptions", function_node)
 
     def test_builtin_folding_uses_bindings_from_the_entire_function_scope(self):
         range_function = ast.parse(

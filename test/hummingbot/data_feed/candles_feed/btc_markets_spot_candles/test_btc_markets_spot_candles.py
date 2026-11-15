@@ -852,24 +852,43 @@ class TestBtcMarketsSpotCandles(TestCandlesBase):
             await self.data_feed.stop_network()
 
     async def test_stop_network_timeout(self):
-        """Test stop_network with timeout scenario"""
-        with patch.object(self.data_feed, "fetch_recent_candles", new_callable=AsyncMock) as mock_fetch:
-            # Make fetch hang to simulate timeout
-            async def hanging_fetch(*args, **kwargs):
-                await asyncio.sleep(20)  # Longer than timeout
-                return []
+        generation = object()
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+        cancellation_count = 0
 
-            mock_fetch.side_effect = hanging_fetch
+        async def cancellation_suppressing_poll():
+            nonlocal cancellation_count
+            started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellation_count += 1
+                    cancellation_seen.set()
 
-            await self.data_feed.start_network()
-            await asyncio.sleep(0.1)
+        polling_task = asyncio.create_task(cancellation_suppressing_poll())
+        self.data_feed._start_candle_generation(generation)
+        self.data_feed._polling_task_owner.create_task(generation, lambda: polling_task)
+        self.data_feed._polling_generation = generation
+        self.data_feed._polling_task = polling_task
+        self.data_feed._is_running = True
+        await started.wait()
 
-            # Patch wait_for to simulate timeout
-            with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
-                await self.data_feed.stop_network()
+        try:
+            with patch.object(type(self.data_feed), "_POLLING_TASK_STOP_TIMEOUT", 0.01):
+                await asyncio.wait_for(self.data_feed.stop_network(), timeout=0.25)
 
-                # Task should be cancelled
-                self.assertTrue(self.data_feed._polling_task is None or self.data_feed._polling_task.cancelled())
+            await cancellation_seen.wait()
+            self.assertEqual(1, cancellation_count)
+            self.assertFalse(polling_task.done())
+            self.assertIn(polling_task, self.data_feed._polling_task_owner.residual_tasks)
+            self.assertIs(self.data_feed._polling_task, polling_task)
+        finally:
+            release.set()
+            await polling_task
+            await self.data_feed._polling_task_owner.wait_until_released()
 
     async def test_listen_for_subscriptions_starts_network(self):
         """Test that listen_for_subscriptions starts network if not running"""
@@ -910,6 +929,84 @@ class TestBtcMarketsSpotCandles(TestCandlesBase):
 
             with self.assertRaises(asyncio.CancelledError):
                 await listen_task
+
+    async def test_listener_exit_always_releases_polling_and_fill_generations(self):
+        async def run_exit_case(exit_mode):
+            feed = BtcMarketsSpotCandles(trading_pair=self.trading_pair, interval=self.interval)
+            generation = object()
+            fill_started = asyncio.Event()
+            fill_cancelled = asyncio.Event()
+            polling_started = asyncio.Event()
+            listener_started = asyncio.Event()
+            release_polling = asyncio.Event()
+
+            async def fill_candles():
+                fill_started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    fill_cancelled.set()
+                    raise
+
+            async def poll_candles():
+                polling_started.set()
+                await release_polling.wait()
+                if exit_mode == "normal":
+                    return
+                if exit_mode == "error":
+                    raise RuntimeError("poll failed")
+                await asyncio.Future()
+
+            feed._start_candle_generation(generation)
+            fill_task = asyncio.create_task(fill_candles())
+            feed._create_fill_candles_task(generation, lambda: fill_task)
+            polling_task = asyncio.create_task(poll_candles())
+            feed._polling_task_owner.create_task(generation, lambda: polling_task)
+            feed._polling_generation = generation
+            feed._polling_task = polling_task
+            feed._is_running = True
+            feed._candles.append(self.get_fetch_candles_data_mock()[0])
+            feed._ws_candle_available.set()
+            await fill_started.wait()
+
+            async def start_network():
+                listener_started.set()
+
+            with patch.object(feed, "start_network", side_effect=start_network):
+                listener_task = asyncio.create_task(feed.listen_for_subscriptions())
+                await listener_started.wait()
+                await asyncio.sleep(0)
+                if exit_mode == "cancel":
+                    listener_task.cancel("shutdown")
+                else:
+                    release_polling.set()
+
+                expected_error = (
+                    asyncio.CancelledError if exit_mode == "cancel"
+                    else RuntimeError if exit_mode == "error"
+                    else None
+                )
+                if expected_error is None:
+                    await asyncio.wait_for(listener_task, timeout=1.0)
+                else:
+                    with self.assertRaises(expected_error):
+                        await asyncio.wait_for(listener_task, timeout=1.0)
+
+            self.assertTrue(fill_cancelled.is_set(), exit_mode)
+            await asyncio.wait_for(
+                feed._fill_candles_task_owner.wait_until_released(), timeout=1.0
+            )
+            await asyncio.wait_for(
+                feed._polling_task_owner.wait_until_released(), timeout=1.0
+            )
+            self.assertIsNone(feed._polling_generation)
+            self.assertFalse(feed._is_running)
+            self.assertFalse(feed._ws_candle_available.is_set())
+            self.assertEqual(0, len(feed._candles))
+
+        for exit_mode in ("normal", "cancel", "error"):
+            with self.subTest(exit_mode=exit_mode):
+                await run_exit_case(exit_mode)
 
     async def test_polling_loop_with_timeout(self):
         """Test polling loop runs for a specific duration"""

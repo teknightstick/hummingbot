@@ -342,6 +342,8 @@ class GeminiAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return current_id
 
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
-        self._snapshot_symbols.clear()
-        self._last_update_ids.clear()
-        await super()._on_order_stream_interruption(websocket_assistant=websocket_assistant)
+        try:
+            self._snapshot_symbols.clear()
+            self._last_update_ids.clear()
+        finally:
+            await super()._on_order_stream_interruption(websocket_assistant=websocket_assistant)

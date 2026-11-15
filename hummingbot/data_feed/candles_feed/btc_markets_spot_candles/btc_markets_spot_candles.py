@@ -6,7 +6,7 @@ from typing import List, Optional
 from dateutil.parser import parse as dateparse
 
 from hummingbot.core.network_iterator import NetworkStatus
-from hummingbot.core.utils.async_utils import await_primary_then_cleanup, safe_ensure_future
+from hummingbot.core.utils.async_utils import GenerationOwnedTaskOwner, await_primary_then_cleanup, safe_ensure_future
 from hummingbot.data_feed.candles_feed.btc_markets_spot_candles import constants as CONSTANTS
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.logger import HummingbotLogger
@@ -22,6 +22,7 @@ class BtcMarketsSpotCandles(CandlesBase):
     """
 
     _logger: Optional[HummingbotLogger] = None
+    _POLLING_TASK_STOP_TIMEOUT = 10.0
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -38,6 +39,15 @@ class BtcMarketsSpotCandles(CandlesBase):
         # Task management for polling
         self._polling_task: Optional[asyncio.Task] = None
         self._polling_generation: Optional[object] = None
+        self._polling_task_owner = GenerationOwnedTaskOwner(
+            logger=self.logger(),
+            cleanup_error_message="Error while cleaning up the BTC Markets polling task",
+            residual_warning_message=(
+                "BTC Markets polling task did not stop before the cleanup deadline; "
+                "retaining residual ownership."
+            ),
+            on_task_done=self._release_polling_task,
+        )
         self._shutdown_event = asyncio.Event()
         self._is_running = False
 
@@ -101,15 +111,19 @@ class BtcMarketsSpotCandles(CandlesBase):
         await self.stop_network()
         await self.initialize_exchange_data()
         await self._fill_candles_task_owner.wait_until_released()
+        await self._polling_task_owner.wait_until_released()
         generation = object()
         self._start_candle_generation(generation)
         self._polling_generation = generation
         self._is_running = True
         self._shutdown_event.clear()
         try:
-            self._polling_task = asyncio.create_task(self._polling_loop(generation))
+            self._polling_task = self._polling_task_owner.create_task(
+                generation,
+                lambda: asyncio.create_task(self._polling_loop(generation)),
+            )
         except BaseException:
-            await self._on_candle_generation_interruption(generation)
+            await self._on_polling_generation_interruption(generation)
             self._polling_generation = None
             self._is_running = False
             raise
@@ -118,40 +132,60 @@ class BtcMarketsSpotCandles(CandlesBase):
         """
         Stop the network by gracefully shutting down the polling task.
         """
-        polling_task = self._polling_task
         generation = self._polling_generation
+        polling_task = None
 
         async def stop_polling():
+            nonlocal polling_task
+            polling_task = self._polling_task_owner.task_for(generation)
             if polling_task is None or polling_task.done():
                 return
             self._is_running = False
             self._shutdown_event.set()
 
-            try:
-                # Wait for graceful shutdown
-                await asyncio.wait_for(polling_task, timeout=10.0)
-            except asyncio.TimeoutError:
+            _, pending = await asyncio.wait(
+                {polling_task},
+                timeout=self._POLLING_TASK_STOP_TIMEOUT,
+            )
+            if pending:
                 self.logger().warning("Polling task didn't stop gracefully, cancelling...")
-                polling_task.cancel()
-                try:
-                    await polling_task
-                except asyncio.CancelledError:
-                    pass
 
         try:
             await await_primary_then_cleanup(
                 primary=stop_polling(),
-                cleanup=(lambda: self._on_candle_generation_interruption(generation))
+                cleanup=(lambda: self._on_polling_generation_interruption(generation))
                 if generation is not None else None,
                 logger=self.logger(),
                 cleanup_error_message="Error while stopping the BTC Markets candle generation",
             )
         finally:
-            if self._polling_task is polling_task:
+            if self._polling_task is polling_task and (polling_task is None or polling_task.done()):
                 self._polling_task = None
             if self._polling_generation is generation:
                 self._polling_generation = None
             self._is_running = False
+
+    def _release_polling_task(self, polling_task: asyncio.Task):
+        if self._polling_task is polling_task:
+            self._polling_task = None
+
+    async def _on_polling_generation_interruption(self, generation: object):
+        async def cleanup_polling_task():
+            polling_task = self._polling_task_owner.task_for(generation)
+            if polling_task is not None:
+                # The graceful wait consumed the hard deadline. Cancel once and retain
+                # a suppressing residual without waiting past that deadline.
+                await self._polling_task_owner.cleanup(polling_task, timeout=0.0)
+
+        try:
+            return await await_primary_then_cleanup(
+                primary=cleanup_polling_task(),
+                cleanup=lambda: self._on_candle_generation_interruption(generation),
+                logger=self.logger(),
+                cleanup_error_message="Error while ending the BTC Markets candle generation",
+            )
+        finally:
+            self._polling_task_owner.end_generation(generation)
 
     async def check_network(self) -> NetworkStatus:
         rest_assistant = await self._api_factory.get_rest_assistant()
@@ -486,15 +520,31 @@ class BtcMarketsSpotCandles(CandlesBase):
         Legacy method for compatibility with base class.
         Now just delegates to the task-based approach.
         """
-        await self.start_network()
+        generation = None
 
-        # Wait for the polling task to complete
-        if self._polling_task:
-            try:
-                await self._polling_task
-            except asyncio.CancelledError:
-                self.logger().info("Listen for subscriptions cancelled")
-                raise
+        async def listen_to_polling_generation():
+            nonlocal generation
+            await self.start_network()
+            generation = self._polling_generation
+            polling_task = self._polling_task_owner.task_for(generation)
+            if polling_task is not None:
+                return await polling_task
+
+        async def cleanup_polling_generation():
+            if generation is not None:
+                await self._on_polling_generation_interruption(generation)
+
+        try:
+            return await await_primary_then_cleanup(
+                primary=listen_to_polling_generation(),
+                cleanup=cleanup_polling_generation,
+                logger=self.logger(),
+                cleanup_error_message="Error while ending the BTC Markets listener generation",
+            )
+        finally:
+            if self._polling_generation is generation:
+                self._polling_generation = None
+            self._is_running = False
 
     async def _poll_and_update_candles(self, generation: Optional[object] = None):
         """

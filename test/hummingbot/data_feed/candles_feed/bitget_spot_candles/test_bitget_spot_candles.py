@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 from hummingbot.connector.test_support.network_mocking_assistant import NetworkMockingAssistant
 from hummingbot.data_feed.candles_feed.bitget_spot_candles import BitgetSpotCandles
+from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 
 
 class TestBitgetSpotCandles(TestCandlesBase):
@@ -94,6 +95,48 @@ class TestBitgetSpotCandles(TestCandlesBase):
                 listener_task.cancel()
                 await asyncio.gather(listener_task, return_exceptions=True)
             await asyncio.gather(fill_task, return_exceptions=True)
+
+    async def test_ping_cleanup_preserves_owner_cancellation_over_primary_error(self):
+        ping_started = asyncio.Event()
+        ping_cancelled = asyncio.Event()
+        release_ping = asyncio.Event()
+
+        async def suppress_first_cancellation(_websocket_assistant):
+            ping_started.set()
+            while not release_ping.is_set():
+                try:
+                    await release_ping.wait()
+                except asyncio.CancelledError:
+                    ping_cancelled.set()
+
+        async def fail_after_ping_starts(*_args, **_kwargs):
+            await ping_started.wait()
+            raise RuntimeError("primary failed")
+
+        owner_task = None
+        try:
+            with patch.object(
+                self.data_feed,
+                "send_interval_ping",
+                side_effect=suppress_first_cancellation,
+            ), patch.object(
+                CandlesBase,
+                "_process_websocket_messages",
+                side_effect=fail_after_ping_starts,
+            ), patch.object(type(self.data_feed), "_PING_TASK_CLEANUP_TIMEOUT", 1.0):
+                owner_task = asyncio.create_task(
+                    self.data_feed._process_websocket_messages(AsyncMock())
+                )
+                await ping_cancelled.wait()
+                owner_task.cancel("shutdown")
+                release_ping.set()
+
+                with self.assertRaises(asyncio.CancelledError):
+                    await owner_task
+        finally:
+            release_ping.set()
+            if owner_task is not None:
+                await asyncio.gather(owner_task, return_exceptions=True)
 
     @staticmethod
     def get_candles_rest_data_mock():

@@ -4,6 +4,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from hummingbot.core.network_iterator import NetworkStatus
+from hummingbot.core.utils.async_utils import GenerationOwnedTaskOwner, await_primary_then_cleanup
 from hummingbot.core.web_assistant.connections.data_types import WSPlainTextRequest
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.data_feed.candles_feed.bitget_spot_candles import constants as CONSTANTS
@@ -13,6 +14,7 @@ from hummingbot.logger import HummingbotLogger
 
 class BitgetSpotCandles(CandlesBase):
     _logger: Optional[HummingbotLogger] = None
+    _PING_TASK_CLEANUP_TIMEOUT = 1.0
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -24,6 +26,15 @@ class BitgetSpotCandles(CandlesBase):
         super().__init__(trading_pair, interval, max_records)
 
         self._ping_task: Optional[asyncio.Task] = None
+        self._ping_task_owner = GenerationOwnedTaskOwner(
+            logger=self.logger(),
+            cleanup_error_message="Error while cleaning up the Bitget candle ping task",
+            residual_warning_message=(
+                "Bitget candle ping task did not stop before the cleanup deadline; "
+                "retaining residual ownership."
+            ),
+            on_task_done=self._release_ping_task,
+        )
 
     @property
     def name(self):
@@ -243,16 +254,26 @@ class BitgetSpotCandles(CandlesBase):
         return await super().listen_for_subscriptions()
 
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant):
-        self._ping_task = asyncio.create_task(self.send_interval_ping(websocket_assistant))
+        await self._ping_task_owner.wait_until_released()
+        ping_task = None
         try:
-            return await super()._process_websocket_messages(websocket_assistant)
+            ping_task = self._ping_task_owner.create_task(
+                websocket_assistant,
+                lambda: asyncio.create_task(self.send_interval_ping(websocket_assistant)),
+            )
+            self._ping_task = ping_task
+            return await await_primary_then_cleanup(
+                primary=super()._process_websocket_messages(websocket_assistant),
+                cleanup=lambda: self._ping_task_owner.cleanup(
+                    ping_task,
+                    timeout=self._PING_TASK_CLEANUP_TIMEOUT,
+                ),
+                logger=self.logger(),
+                cleanup_error_message="Error while cleaning up the Bitget candle ping task owner",
+            )
         finally:
-            ping_task = self._ping_task
-            if ping_task is not None:
-                ping_task.cancel()
-                try:
-                    await ping_task
-                except asyncio.CancelledError:
-                    pass
-                if self._ping_task is ping_task:
-                    self._ping_task = None
+            self._ping_task_owner.end_generation(websocket_assistant)
+
+    def _release_ping_task(self, ping_task: asyncio.Task):
+        if self._ping_task is ping_task:
+            self._ping_task = None

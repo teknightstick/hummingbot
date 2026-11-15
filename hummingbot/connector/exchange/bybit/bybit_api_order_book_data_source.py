@@ -165,13 +165,16 @@ class BybitAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 )
                 await self._sleep(5.0)
             finally:
-                self._ws_assistant = None
-                await await_primary_then_cleanup(
-                    primary=ws.disconnect() if ws is not None else None,
-                    cleanup=None,
-                    logger=self.logger(),
-                    cleanup_error_message="Error while interrupting the Bybit order book stream",
-                )
+                try:
+                    await await_primary_then_cleanup(
+                        primary=ws.disconnect() if ws is not None else None,
+                        cleanup=None,
+                        logger=self.logger(),
+                        cleanup_error_message="Error while interrupting the Bybit order book stream",
+                    )
+                finally:
+                    if self._ws_assistant is ws:
+                        self._ws_assistant = None
 
     async def _subscribe_channels(self, ws: WSAssistant):
         """

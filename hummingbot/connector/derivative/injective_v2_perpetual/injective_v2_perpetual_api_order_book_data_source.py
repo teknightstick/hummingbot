@@ -8,6 +8,7 @@ from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.perpetual_api_order_book_data_source import PerpetualAPIOrderBookDataSource
 from hummingbot.core.event.event_forwarder import EventForwarder
 from hummingbot.core.event.events import MarketEvent, OrderBookDataSourceEvent
+from hummingbot.core.utils.async_utils import await_primary_then_cleanup
 
 if TYPE_CHECKING:
     from hummingbot.connector.derivative.injective_v2_perpetual.injective_v2_perpetual_derivative import (
@@ -44,9 +45,17 @@ class InjectiveV2PerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource
     async def listen_for_subscriptions(self):
         # Subscriptions to streams is handled by the data_source
         # Here we just make sure the data_source is listening to the streams
-        market_ids = [await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                      for trading_pair in self._trading_pairs]
-        await self._data_source.start(market_ids=market_ids)
+        async def start_data_source():
+            market_ids = [await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                          for trading_pair in self._trading_pairs]
+            await self._data_source.start(market_ids=market_ids)
+
+        await await_primary_then_cleanup(
+            primary=start_data_source(),
+            cleanup=None,
+            logger=self.logger(),
+            cleanup_error_message="Error while starting the Injective perpetual data source",
+        )
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)

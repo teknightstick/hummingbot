@@ -355,7 +355,13 @@ class EvedexPerpetualCandles(CandlesBase):
         }
 
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
-        if self._ping_task is not None:
-            self._ping_task.cancel()
-            self._ping_task = None
-        await super()._on_order_stream_interruption(websocket_assistant)
+        ping_task = self._ping_task
+        try:
+            try:
+                if ping_task is not None:
+                    ping_task.cancel()
+            finally:
+                if self._ping_task is ping_task:
+                    self._ping_task = None
+        finally:
+            await super()._on_order_stream_interruption(websocket_assistant)

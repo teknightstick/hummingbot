@@ -148,11 +148,13 @@ class LighterPerpetualCandles(CandlesBase):
 
     async def listen_for_subscriptions(self):
         # Lighter has no WebSocket candle stream — poll REST every 10 seconds
-        generation = object()
-        await self._fill_candles_task_owner.wait_until_released()
-        self._start_candle_generation(generation)
+        generation = None
 
         async def poll_candles():
+            nonlocal generation
+            generation = object()
+            await self._fill_candles_task_owner.wait_until_released()
+            self._start_candle_generation(generation)
             while True:
                 try:
                     now_s = int(time.time())

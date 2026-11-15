@@ -17,7 +17,7 @@ from hummingbot.connector.exchange.xrpl.xrpl_worker_pool import XRPLQueryWorkerP
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
-from hummingbot.core.utils.async_utils import safe_gather
+from hummingbot.core.utils.async_utils import await_primary_then_cleanup, safe_gather
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.logger import HummingbotLogger
 
@@ -525,17 +525,25 @@ class XRPLAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 finally:
                     await self._sleep(CONSTANTS.SUBSCRIPTION_RECONNECT_DELAY)
 
-        tasks = [handle_subscription(trading_pair) for trading_pair in self._trading_pairs]
+        async def listen_and_cleanup():
+            tasks = [handle_subscription(trading_pair) for trading_pair in self._trading_pairs]
 
-        try:
-            await safe_gather(*tasks)
-        finally:
-            # Cleanup all subscription connections on shutdown
-            async with self._subscription_lock:
-                for trading_pair, conn in list(self._subscription_connections.items()):
-                    await self._close_subscription_connection(conn.client)
-                self._subscription_connections.clear()
-            self.logger().debug("[SUBSCRIPTION] All subscription connections closed")
+            try:
+                await safe_gather(*tasks)
+            finally:
+                # Cleanup all subscription connections on shutdown
+                async with self._subscription_lock:
+                    for trading_pair, conn in list(self._subscription_connections.items()):
+                        await self._close_subscription_connection(conn.client)
+                    self._subscription_connections.clear()
+                self.logger().debug("[SUBSCRIPTION] All subscription connections closed")
+
+        await await_primary_then_cleanup(
+            primary=listen_and_cleanup(),
+            cleanup=None,
+            logger=self.logger(),
+            cleanup_error_message="Error while cleaning up XRPL subscription listeners",
+        )
 
     async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
         """Dynamic subscription not supported for this connector."""
